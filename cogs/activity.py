@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord.ext import commands
@@ -72,6 +73,25 @@ class ActivityCog(commands.Cog):
             return
         await self.db.update_user_state(phase=phase)
         await ctx.send(f"Phase set to {phase}.")
+
+    @commands.command(name="timezone")
+    async def timezone_command(self, ctx: commands.Context, *, timezone_name: str = "") -> None:
+        if not timezone_name.strip():
+            current = await self.db.get_user_timezone()
+            await ctx.send(f"Current timezone: `{current}`")
+            return
+
+        candidate = timezone_name.strip()
+        try:
+            ZoneInfo(candidate)
+        except ZoneInfoNotFoundError:
+            await ctx.send(
+                "Invalid timezone. Use an IANA timezone like `America/New_York`, `Europe/London`, or `Asia/Shanghai`."
+            )
+            return
+
+        await self.db.set_user_timezone(candidate)
+        await ctx.send(f"Timezone set to `{candidate}`.")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:

@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS user_state (
     current_day_index INTEGER DEFAULT 0,
     phase TEXT DEFAULT 'maintain',
     default_unit TEXT DEFAULT 'lbs',
+    timezone TEXT DEFAULT 'UTC',
     readiness INTEGER DEFAULT 7,
     weeks_since_deload INTEGER DEFAULT 0,
     current_streak INTEGER DEFAULT 0,

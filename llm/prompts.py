@@ -36,6 +36,8 @@ Exercise categories:
 
 Rules:
 - 3x8-10 means sets=3, rep_range_low=8, rep_range_high=10
+- 2x5 means sets=2, rep_range_low=5, rep_range_high=5
+- 2x10 means sets=2, rep_range_low=10, rep_range_high=10
 - 1x3-5 means sets=1, rep_range_low=3, rep_range_high=5
 - 3x8+8 means superset - two exercises, same superset_group number
 - AMRAP means rep_range_low=null, rep_range_high=null, notes="AMRAP"
@@ -43,6 +45,14 @@ Rules:
 - 3x(5+15) means special rep scheme, put in notes
 - Days are ordered sequentially starting at day_order=0
 - Assign muscle_groups for every exercise
+- Do not drop day headers. If input has 5 day headers, output must contain exactly 5 days.
+- Do not drop exercise lines inside a day. Keep every exercise from the source text.
+- rep_range_low/high can only be null for true AMRAP or clearly unspecified targets.
+- Category examples:
+  - RDL / Romanian Deadlift / Pause Squat -> light_barbell
+  - Squat / Bench Press / Deadlift / OHP / Barbell Row -> heavy_barbell
+  - Lat Pulldown / Leg Press / Machine Row / Cable Fly -> cable_machine
+  - Pull-Up / Chin-Up / Push-Up / Dip -> bodyweight
 - Return ONLY valid JSON, no markdown backticks or preamble
 """.strip()
 

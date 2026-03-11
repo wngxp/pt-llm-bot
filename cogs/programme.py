@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date, timedelta
 
@@ -26,8 +27,65 @@ class ProgrammeCog(commands.Cog):
             return cid == self.settings.programme_channel_id
         return name == "programme"
 
-    async def _import_program(self, channel: discord.abc.Messageable, raw_text: str) -> int:
+    def _is_placeholder_name(self, name: str) -> bool:
+        cleaned = name.strip().lower()
+        if not cleaned:
+            return True
+        return cleaned in {"unnamed", "unnamed program", "untitled", "untitled program", "imported program"}
+
+    def _infer_program_name_from_text(self, raw_text: str) -> str | None:
+        patterns = [
+            re.compile(r"\bprogram\s*[:\-]\s*(?P<name>[A-Za-z0-9][A-Za-z0-9 '\-_]{1,60})", re.IGNORECASE),
+            re.compile(r"\b(?:this is|it's|it is)\s+(?:my\s+)?(?P<name>[A-Za-z0-9][A-Za-z0-9 '\-_]{1,60})\s+program\b", re.IGNORECASE),
+            re.compile(r"\bmy\s+(?P<name>[A-Za-z0-9][A-Za-z0-9 '\-_]{1,60})\s+program\b", re.IGNORECASE),
+        ]
+        for pattern in patterns:
+            match = pattern.search(raw_text)
+            if match:
+                return match.group("name").strip()
+        return None
+
+    async def _resolve_program_name(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        raw_text: str,
+        parsed_name: str,
+    ) -> str:
+        if not self._is_placeholder_name(parsed_name):
+            return parsed_name.strip()
+
+        inferred = self._infer_program_name_from_text(raw_text)
+        if inferred:
+            return inferred
+
+        await channel.send("What would you like to name this program?")
+        try:
+            reply = await self.bot.wait_for(
+                "message",
+                timeout=60,
+                check=lambda m: m.author.id == author.id and m.channel.id == getattr(channel, "id", None),
+            )
+            candidate = reply.content.strip()
+            if candidate:
+                return candidate[:80]
+        except asyncio.TimeoutError:
+            pass
+        return "Imported Program"
+
+    async def _import_program(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        raw_text: str,
+    ) -> int:
         parsed = await self.parser.parse_program(raw_text)
+        parsed["program_name"] = await self._resolve_program_name(
+            channel,
+            author,
+            raw_text,
+            str(parsed.get("program_name") or ""),
+        )
         program_id = await self.db.create_program_from_payload(parsed)
 
         days = parsed.get("days", [])
@@ -42,7 +100,7 @@ class ProgrammeCog(commands.Cog):
     async def import_program_command(self, ctx: commands.Context, *, text: str) -> None:
         if not self._is_programme_channel(ctx.channel):
             return
-        await self._import_program(ctx.channel, text)
+        await self._import_program(ctx.channel, ctx.author, text)
 
     @commands.command(name="program")
     async def show_program_command(self, ctx: commands.Context) -> None:
@@ -127,7 +185,7 @@ class ProgrammeCog(commands.Cog):
             return
 
         try:
-            await self._import_program(message.channel, content)
+            await self._import_program(message.channel, message.author, content)
         except Exception as exc:
             await message.channel.send(f"Could not parse program: {exc}")
 

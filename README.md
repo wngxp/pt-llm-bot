@@ -103,6 +103,7 @@ python3 bot.py
 - `!activity <description>`
 - `!readiness <1-10>`
 - `!phase <cut|bulk|maintain>`
+- `!timezone [IANA tz name]` (example: `America/New_York`)
 - `!checkin`
 - `!ask <question>`
 - `!prs [days]`

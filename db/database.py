@@ -50,13 +50,42 @@ class Database:
         schema = schema_path.read_text(encoding="utf-8")
         async with self.connect() as conn:
             await conn.executescript(schema)
+            await self._ensure_user_state_timezone_column(conn)
             await conn.execute(
                 """
                 INSERT OR IGNORE INTO user_state (id)
                 VALUES (1)
                 """
             )
+            system_tz = self._detect_system_timezone()
+            await conn.execute(
+                """
+                UPDATE user_state
+                SET timezone = COALESCE(NULLIF(timezone, ''), ?)
+                WHERE id = 1
+                """,
+                (system_tz,),
+            )
             await conn.commit()
+
+    async def _ensure_user_state_timezone_column(self, conn: aiosqlite.Connection) -> None:
+        rows = await self._fetchall(conn, "PRAGMA table_info(user_state)")
+        columns = {str(r["name"]).lower() for r in rows}
+        if "timezone" in columns:
+            return
+        await conn.execute("ALTER TABLE user_state ADD COLUMN timezone TEXT DEFAULT 'UTC'")
+
+    def _detect_system_timezone(self) -> str:
+        tzinfo = datetime.now().astimezone().tzinfo
+        if tzinfo is None:
+            return "UTC"
+        key = getattr(tzinfo, "key", None)
+        if isinstance(key, str) and key:
+            return key
+        name = datetime.now().astimezone().tzname()
+        if isinstance(name, str) and "/" in name:
+            return name
+        return "UTC"
 
     async def get_user_state(self) -> dict[str, Any]:
         async with self.connect() as conn:
@@ -76,6 +105,14 @@ class Database:
     async def get_current_day_index(self) -> int:
         state = await self.get_user_state()
         return int(state.get("current_day_index") or 0)
+
+    async def get_user_timezone(self) -> str:
+        state = await self.get_user_state()
+        tz = str(state.get("timezone") or "").strip()
+        return tz or "UTC"
+
+    async def set_user_timezone(self, timezone_name: str) -> None:
+        await self.update_user_state(timezone=timezone_name)
 
     async def set_current_day_index(self, day_index: int) -> None:
         await self.update_user_state(current_day_index=max(0, day_index))
