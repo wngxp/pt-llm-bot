@@ -1,3 +1,18 @@
+## [0.5.0] - 2026-03-12
+### Fixed
+- Travel/vacation edits in `#programme` now follow discuss -> confirm -> save and persist to the database as temporary programs (`temporary=1`, `parent_program_id`, `expires_at`).
+- Travel reversion flow now works both automatically on expiry and immediately via `"im back"` in `#programme`.
+- PR diagnostics were expanded: startup now logs configured PR channel/cog state, per-set PR checks log full decision details, and PR channel delivery now logs resolution results.
+- PR channel resolution is now more reliable by falling back to `fetch_channel(...)` when cache lookup misses.
+- PR posts in `#prs` now mention the actual user (`<@user_id>`) for both first benchmarks and improvements.
+- `!travel` now uses the same pending programme review flow as message-based travel requests, preventing unsaved or inconsistent travel edits.
+- Changelog startup posts now render real newlines instead of literal `\\n`.
+
+### Added
+- Multi-user database support across state, programs, logs, activities, injuries, PRs, cues, and sessions via `user_id`.
+- Multi-user migration helpers to backfill existing data to a legacy user and initialize per-user state automatically.
+- `Database.list_user_ids()` and per-user weekly check-in auto-posting so proactive summaries are generated independently per user.
+
 ## [0.4.1] - 2026-03-12
 ### Fixed
 - `#programme` review output is now sent as per-day messages, preventing long swap reviews from being cut off mid-sentence.

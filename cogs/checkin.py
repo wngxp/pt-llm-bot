@@ -41,19 +41,22 @@ class CheckInCog(commands.Cog):
             return cid == self.settings.checkin_channel_id or name == "check-in"
         return name == "check-in"
 
-    async def _generate_summary(self) -> str:
+    def clear_runtime_state(self) -> None:
+        return None
+
+    async def _generate_summary(self, *, user_id: str) -> str:
         today = date.today()
         week_start = today - timedelta(days=today.weekday())
         week_end = week_start + timedelta(days=6)
 
-        state = await self.db.get_user_state()
-        prs = await self.db.get_recent_prs(7)
-        weekly_volume = await self.db.get_weekly_volume(start_date=week_start)
-        trend = await self.db.get_trend_last_4_weeks()
-        context = await self.db.build_context(target_date=today)
+        state = await self.db.get_user_state(user_id)
+        prs = await self.db.get_recent_prs(7, user_id=user_id)
+        weekly_volume = await self.db.get_weekly_volume(user_id=user_id, start_date=week_start)
+        trend = await self.db.get_trend_last_4_weeks(user_id=user_id)
+        context = await self.db.build_context(target_date=today, user_id=user_id)
 
         sessions_count = 0
-        latest_workout = await self.db.get_latest_workout_date()
+        latest_workout = await self.db.get_latest_workout_date(user_id=user_id)
         if latest_workout and latest_workout >= week_start:
             sessions_count = min(7, (today - week_start).days + 1)
 
@@ -99,21 +102,21 @@ class CheckInCog(commands.Cog):
         except Exception:
             return "\n".join(local_lines)
 
-    async def _adjust_readiness_from_text(self, text: str) -> Optional[tuple[int, str]]:
+    async def _adjust_readiness_from_text(self, text: str, *, user_id: str) -> Optional[tuple[int, str]]:
         lowered = text.lower()
         for keywords, delta, reason in READINESS_RULES:
             if any(keyword in lowered for keyword in keywords):
-                state = await self.db.get_user_state()
+                state = await self.db.get_user_state(user_id)
                 current = int(state.get("readiness") or 7)
                 next_value = max(1, min(10, current + delta))
                 if next_value == current:
                     return next_value, reason
-                await self.db.update_user_state(readiness=next_value)
+                await self.db.update_user_state(user_id, readiness=next_value)
                 return next_value, reason
         return None
 
-    async def _reply_short_checkin_chat(self, text: str) -> str:
-        context = await self.db.build_context(target_date=date.today())
+    async def _reply_short_checkin_chat(self, text: str, *, user_id: str) -> str:
+        context = await self.db.build_context(target_date=date.today(), user_id=user_id)
         prompt = {
             "message": text,
             "response_style": "Reply in 2-3 short sentences.",
@@ -144,16 +147,18 @@ class CheckInCog(commands.Cog):
     async def checkin_command(self, ctx: commands.Context) -> None:
         if not self._is_checkin_channel(ctx.channel):
             return
-        summary = await self._generate_summary()
-        await self.db.set_last_checkin(date.today())
+        user_id = str(ctx.author.id)
+        summary = await self._generate_summary(user_id=user_id)
+        await self.db.set_last_checkin(date.today(), user_id=user_id)
         await send_discord_text(ctx.channel, summary)
 
     @commands.command(name="summary")
     async def summary_command(self, ctx: commands.Context) -> None:
         if not self._is_checkin_channel(ctx.channel):
             return
-        summary = await self._generate_summary()
-        await self.db.set_last_checkin(date.today())
+        user_id = str(ctx.author.id)
+        summary = await self._generate_summary(user_id=user_id)
+        await self.db.set_last_checkin(date.today(), user_id=user_id)
         await send_discord_text(ctx.channel, summary)
 
     async def _get_checkin_channel(self) -> Optional[discord.TextChannel]:
@@ -182,21 +187,33 @@ class CheckInCog(commands.Cog):
         if now.weekday() != 5 or now.hour < 18:
             return
 
-        week_start = date.today() - timedelta(days=date.today().weekday())
-        last_checkin = await self.db.get_last_checkin_date()
-        if last_checkin and last_checkin >= week_start:
-            return
-
         channel = await self._get_checkin_channel()
         if not channel:
             return
 
-        summary = await self._generate_summary()
-        await send_discord_text(
-            channel,
-            "You haven't checked in yet this week. Here's your proactive summary:\n\n" + summary,
-        )
-        await self.db.set_last_checkin(date.today())
+        week_start = date.today() - timedelta(days=date.today().weekday())
+        user_ids = await self.db.list_user_ids()
+        if not user_ids:
+            return
+
+        for user_id in user_ids:
+            state = await self.db.get_user_state(user_id)
+            if (
+                not state.get("current_program_id")
+                and not state.get("last_workout_date")
+                and not state.get("last_checkin_date")
+            ):
+                continue
+            last_checkin = await self.db.get_last_checkin_date(user_id=user_id)
+            if last_checkin and last_checkin >= week_start:
+                continue
+            summary = await self._generate_summary(user_id=user_id)
+            mention = f"<@{user_id}> " if str(user_id).isdigit() else ""
+            await send_discord_text(
+                channel,
+                f"{mention}You haven't checked in yet this week. Here's your proactive summary:\n\n{summary}",
+            )
+            await self.db.set_last_checkin(date.today(), user_id=user_id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -209,7 +226,8 @@ class CheckInCog(commands.Cog):
         if not content or content.startswith(self.settings.command_prefix):
             return
 
-        readiness_update = await self._adjust_readiness_from_text(content)
+        user_id = str(message.author.id)
+        readiness_update = await self._adjust_readiness_from_text(content, user_id=user_id)
         if readiness_update:
             score, reason = readiness_update
             await send_discord_text(
@@ -220,12 +238,12 @@ class CheckInCog(commands.Cog):
 
         lowered = content.lower()
         if any(token in lowered for token in {"summary", "weekly", "check in", "check-in"}):
-            summary = await self._generate_summary()
-            await self.db.set_last_checkin(date.today())
+            summary = await self._generate_summary(user_id=user_id)
+            await self.db.set_last_checkin(date.today(), user_id=user_id)
             await send_discord_text(message.channel, summary)
             return
 
-        reply = await self._reply_short_checkin_chat(content)
+        reply = await self._reply_short_checkin_chat(content, user_id=user_id)
         await send_discord_text(message.channel, reply)
 
 

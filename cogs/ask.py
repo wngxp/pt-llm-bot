@@ -71,7 +71,7 @@ class AskCog(commands.Cog):
         return reply.strip()
 
     async def _answer(self, question: str, *, user_id: int, channel_id: int) -> str:
-        context = await self.db.build_context(target_date=self.bot.today())
+        context = await self.db.build_context(target_date=self.bot.today(), user_id=str(user_id))
         history = self.memory.get(user_id=user_id, channel_id=channel_id)
         prompt = {
             "question": question,

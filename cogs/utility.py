@@ -8,7 +8,7 @@ from discord.ext import commands
 from utils.discord_messages import send_discord_text
 
 
-BOT_VERSION = "0.4.1"
+BOT_VERSION = "0.5.0"
 
 
 class UtilityCog(commands.Cog):
@@ -69,48 +69,77 @@ class UtilityCog(commands.Cog):
         self.pending_confirms.pop(key, None)
         return True
 
-    async def _clear_active_workout_sessions(self) -> bool:
+    async def _clear_active_workout_sessions(self, *, user_id: int | None = None) -> bool:
         workout_cog = self.bot.get_cog("WorkoutCog")
         if workout_cog is None:
             return False
         cleared = False
         sessions = getattr(workout_cog, "sessions", None)
-        if isinstance(sessions, dict) and sessions:
-            sessions.clear()
-            cleared = True
+        if isinstance(sessions, dict):
+            if user_id is None:
+                if sessions:
+                    sessions.clear()
+                    cleared = True
+            else:
+                removed = sessions.pop(str(user_id), None)
+                if removed is not None:
+                    cleared = True
         early_prompts = getattr(workout_cog, "early_end_prompts", None)
-        if isinstance(early_prompts, dict) and early_prompts:
-            early_prompts.clear()
-            cleared = True
+        if isinstance(early_prompts, dict):
+            if user_id is None:
+                if early_prompts:
+                    early_prompts.clear()
+                    cleared = True
+            else:
+                keys = [k for k in early_prompts if int(k[1]) == int(user_id)]
+                for key in keys:
+                    early_prompts.pop(key, None)
+                    cleared = True
         timeout_tasks = getattr(workout_cog, "early_end_timeout_tasks", None)
         if isinstance(timeout_tasks, dict):
-            if timeout_tasks:
-                cleared = True
-            for task in timeout_tasks.values():
-                if hasattr(task, "done") and not task.done():
-                    task.cancel()
-            timeout_tasks.clear()
+            if user_id is None:
+                if timeout_tasks:
+                    cleared = True
+                for task in timeout_tasks.values():
+                    if hasattr(task, "done") and not task.done():
+                        task.cancel()
+                timeout_tasks.clear()
+            else:
+                keys = [k for k in timeout_tasks if int(k[1]) == int(user_id)]
+                for key in keys:
+                    task = timeout_tasks.pop(key, None)
+                    if task and hasattr(task, "done") and not task.done():
+                        task.cancel()
+                    cleared = True
         message_map = getattr(workout_cog, "message_log_map", None)
         if isinstance(message_map, dict) and message_map:
-            message_map.clear()
-            cleared = True
+            if user_id is None:
+                message_map.clear()
+                cleared = True
         user_locks = getattr(workout_cog, "user_locks", None)
         if isinstance(user_locks, dict) and user_locks:
-            user_locks.clear()
+            if user_id is None:
+                user_locks.clear()
+            else:
+                user_locks.pop(int(user_id), None)
         return cleared
 
-    def _clear_runtime_memory_state(self) -> None:
+    def _clear_runtime_memory_state(self, *, user_id: int | None = None) -> None:
         for cog_name in ("ProgrammeCog", "AskCog", "CheckInCog"):
             cog = self.bot.get_cog(cog_name)
             if cog is None:
                 continue
-            clear_runtime = getattr(cog, "clear_runtime_state", None)
-            if callable(clear_runtime):
-                clear_runtime()
-                continue
+            if user_id is None:
+                clear_runtime = getattr(cog, "clear_runtime_state", None)
+                if callable(clear_runtime):
+                    clear_runtime()
+                    continue
             memory = getattr(cog, "memory", None)
             if memory and hasattr(memory, "clear_all"):
-                memory.clear_all()
+                if user_id is None:
+                    memory.clear_all()
+                elif hasattr(memory, "clear_user"):
+                    memory.clear_user(user_id=user_id)
 
     @commands.command(name="version")
     async def version_command(self, ctx: commands.Context) -> None:
@@ -164,8 +193,9 @@ class UtilityCog(commands.Cog):
     async def debug_command(self, ctx: commands.Context) -> None:
         if not await self._require_admin(ctx):
             return
-        state = await self.db.get_user_state()
-        program = await self.db.get_active_program()
+        user_id = str(ctx.author.id)
+        state = await self.db.get_user_state(user_id)
+        program = await self.db.get_active_program(user_id)
         program_name = str(program["name"]) if program else "None"
         lines = [
             "Debug state:",
@@ -183,7 +213,8 @@ class UtilityCog(commands.Cog):
     async def setday_command(self, ctx: commands.Context, day_number: int) -> None:
         if not await self._require_admin(ctx):
             return
-        active = await self.db.get_active_program()
+        user_id = str(ctx.author.id)
+        active = await self.db.get_active_program(user_id)
         if not active:
             await send_discord_text(ctx.channel, "No active program.")
             return
@@ -195,8 +226,8 @@ class UtilityCog(commands.Cog):
         if idx < 0 or idx >= len(days):
             await send_discord_text(ctx.channel, f"Day must be between 1 and {len(days)}.")
             return
-        ended = await self._clear_active_workout_sessions()
-        await self.db.set_current_day_index(idx)
+        ended = await self._clear_active_workout_sessions(user_id=ctx.author.id)
+        await self.db.set_current_day_index(idx, user_id=user_id)
         if ended:
             await send_discord_text(
                 ctx.channel,
@@ -213,9 +244,9 @@ class UtilityCog(commands.Cog):
             if not self._consume_confirm(ctx.author.id, "reset"):
                 await send_discord_text(ctx.channel, "Reset confirmation expired. Run `!reset` again.")
                 return
-            await self.db.wipe_workout_data_preserve_settings()
-            await self._clear_active_workout_sessions()
-            self._clear_runtime_memory_state()
+            await self.db.wipe_workout_data_preserve_settings(user_id=str(ctx.author.id))
+            await self._clear_active_workout_sessions(user_id=ctx.author.id)
+            self._clear_runtime_memory_state(user_id=ctx.author.id)
             await send_discord_text(ctx.channel, "All workout data wiped. Timezone/settings were preserved.")
             return
         self._start_confirm(ctx.author.id, "reset")
@@ -233,8 +264,8 @@ class UtilityCog(commands.Cog):
             if not self._consume_confirm(ctx.author.id, "deleteprogram"):
                 await send_discord_text(ctx.channel, "Delete confirmation expired. Run `!deleteprogram` again.")
                 return
-            ok = await self.db.delete_active_program()
-            await self._clear_active_workout_sessions()
+            ok = await self.db.delete_active_program(user_id=str(ctx.author.id))
+            await self._clear_active_workout_sessions(user_id=ctx.author.id)
             if ok:
                 await send_discord_text(ctx.channel, "Active program deleted.")
             else:

@@ -52,5 +52,11 @@ class ConversationMemory:
     def clear(self, *, user_id: int, channel_id: int) -> None:
         self._store.pop((int(user_id), int(channel_id)), None)
 
+    def clear_user(self, *, user_id: int) -> None:
+        uid = int(user_id)
+        keys = [key for key in self._store if key[0] == uid]
+        for key in keys:
+            self._store.pop(key, None)
+
     def clear_all(self) -> None:
         self._store.clear()

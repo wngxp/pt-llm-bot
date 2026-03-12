@@ -100,8 +100,8 @@ class ActivityCog(commands.Cog):
         if ref:
             await send_discord_text(channel, f"Tip: use {ref} for utility commands like this.")
 
-    async def _local_today(self) -> date:
-        tz_name = await self.db.get_user_timezone()
+    async def _local_today(self, user_id: str) -> date:
+        tz_name = await self.db.get_user_timezone(user_id=user_id)
         try:
             tzinfo = ZoneInfo(tz_name)
         except ZoneInfoNotFoundError:
@@ -159,7 +159,7 @@ class ActivityCog(commands.Cog):
         out["intensity"] = intensity
         return out
 
-    async def _estimate_recovery_message(self, muscle_groups: str, intensity: str) -> str:
+    async def _estimate_recovery_message(self, muscle_groups: str, intensity: str, *, user_id: str) -> str:
         recovery_days_map = {"low": 1, "moderate": 2, "high": 3}
         recovery_days = recovery_days_map.get(intensity, 2)
 
@@ -167,8 +167,8 @@ class ActivityCog(commands.Cog):
         if not groups:
             return f"Estimated recovery: ~{recovery_days} day(s)."
 
-        current_index = await self.db.get_current_day_index()
-        active = await self.db.get_active_program()
+        current_index = await self.db.get_current_day_index(user_id=user_id)
+        active = await self.db.get_active_program(user_id=user_id)
         if not active:
             return f"Estimated recovery: ~{recovery_days} day(s) for {', '.join(groups)}."
 
@@ -225,8 +225,8 @@ class ActivityCog(commands.Cog):
                 "short_note": text,
             }
 
-    async def _handle_activity_text(self, channel: discord.abc.Messageable, content: str) -> None:
-        today_local = await self._local_today()
+    async def _handle_activity_text(self, channel: discord.abc.Messageable, content: str, *, user_id: str) -> None:
+        today_local = await self._local_today(user_id)
         known_activity = self._match_known_activity(content)
         if known_activity and "?" in content and not ACTIVITY_VERB_RE.search(content) and not self._has_duration_or_descriptor(content):
             await send_discord_text(
@@ -238,6 +238,7 @@ class ActivityCog(commands.Cog):
         if self._looks_like_injury_report(content):
             groups = self._extract_injury_groups(content)
             await self.db.add_injury(
+                user_id=user_id,
                 injury_date=today_local,
                 description=content,
                 muscle_groups=groups,
@@ -254,6 +255,7 @@ class ActivityCog(commands.Cog):
             classification = await self._classify_activity(content)
             classification = self._normalize_activity_classification(content, classification)
             await self.db.add_activity(
+                user_id=user_id,
                 activity_date=today_local,
                 activity_type=classification["activity_type"],
                 description=content,
@@ -263,6 +265,7 @@ class ActivityCog(commands.Cog):
             recovery_note = await self._estimate_recovery_message(
                 classification["muscle_groups"],
                 classification["intensity"],
+                user_id=user_id,
             )
             await send_discord_text(
                 channel,
@@ -293,12 +296,12 @@ class ActivityCog(commands.Cog):
 
     @commands.command(name="activity")
     async def activity_command(self, ctx: commands.Context, *, description: str) -> None:
-        await self._handle_activity_text(ctx.channel, description)
+        await self._handle_activity_text(ctx.channel, description, user_id=str(ctx.author.id))
 
     @commands.command(name="readiness")
     async def readiness_command(self, ctx: commands.Context, score: int) -> None:
         score = max(1, min(10, score))
-        await self.db.update_user_state(readiness=score)
+        await self.db.update_user_state(str(ctx.author.id), readiness=score)
         await send_discord_text(ctx.channel, f"Readiness updated to {score}/10.")
 
     @commands.command(name="phase")
@@ -307,13 +310,13 @@ class ActivityCog(commands.Cog):
         if phase not in {"cut", "bulk", "maintain"}:
             await send_discord_text(ctx.channel, "Phase must be one of: cut, bulk, maintain.")
             return
-        await self.db.update_user_state(phase=phase)
+        await self.db.update_user_state(str(ctx.author.id), phase=phase)
         await send_discord_text(ctx.channel, f"Phase set to {phase}.")
 
     @commands.command(name="timezone")
     async def timezone_command(self, ctx: commands.Context, *, timezone_name: str = "") -> None:
         if not timezone_name.strip():
-            current = await self.db.get_user_timezone()
+            current = await self.db.get_user_timezone(user_id=str(ctx.author.id))
             await send_discord_text(ctx.channel, f"Current timezone: `{current}`")
             await self._maybe_send_settings_tip(ctx.channel)
             return
@@ -329,7 +332,7 @@ class ActivityCog(commands.Cog):
             await self._maybe_send_settings_tip(ctx.channel)
             return
 
-        await self.db.set_user_timezone(candidate)
+        await self.db.set_user_timezone(candidate, user_id=str(ctx.author.id))
         await send_discord_text(ctx.channel, f"Timezone set to `{candidate}`.")
         await self._maybe_send_settings_tip(ctx.channel)
 
@@ -344,7 +347,7 @@ class ActivityCog(commands.Cog):
         if not content or content.startswith(self.settings.command_prefix):
             return
 
-        await self._handle_activity_text(message.channel, content)
+        await self._handle_activity_text(message.channel, content, user_id=str(message.author.id))
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -25,6 +25,8 @@ EDIT_INTENT_RE = re.compile(r"\b(edit|swap|replace|change|modify)\b", re.IGNOREC
 SET_PATTERN_RE = re.compile(r"\d+\s*[xX×]\s*\d+")
 PENDING_CONFIRM_TOKENS = {"save", "confirm", "import", "looks good", "ship it", "yes"}
 PENDING_CANCEL_TOKENS = {"cancel", "stop", "never mind", "discard"}
+TRAVEL_INTENT_RE = re.compile(r"\b(travel|travelling|traveling|vacation|hotel gym|limited equipment)\b", re.IGNORECASE)
+BACK_INTENT_RE = re.compile(r"\b(i'?m back|im back|back from|returned|home now)\b", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,9 @@ class PendingProgram:
     notes: list[str] = field(default_factory=list)
     latest_suggestions: str = ""
     flow_id: str = field(default_factory=lambda: uuid4().hex)
+    temporary: bool = False
+    parent_program_id: Optional[int] = None
+    expires_at: Optional[str] = None
 
 
 class ProgrammeCog(commands.Cog):
@@ -225,6 +230,37 @@ class ProgrammeCog(commands.Cog):
                 )
         return summary
 
+    async def _program_to_text(self, program_id: int) -> str:
+        days = await self.db.get_program_days(program_id)
+        lines: list[str] = []
+        for day in days:
+            lines.append(str(day.get("name") or f"Day {int(day.get('day_order', 0)) + 1}"))
+            exercises = await self.db.get_exercises_for_day(int(day["id"]))
+            for ex in exercises:
+                sets = int(ex.get("sets") or 1)
+                low = ex.get("rep_range_low")
+                high = ex.get("rep_range_high")
+                notes = str(ex.get("notes") or "").strip()
+                if low is None or high is None:
+                    scheme = "AMRAP" if not notes else f"({notes})"
+                elif int(low) == int(high):
+                    scheme = str(int(low))
+                else:
+                    scheme = f"{int(low)}-{int(high)}"
+                lines.append(f"{ex['name']} - {sets}x{scheme}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _extract_travel_expiry(self, text: str) -> Optional[str]:
+        match = DURATION_RE.search(text or "")
+        if not match:
+            return None
+        num = int(match.group("num"))
+        unit = str(match.group("unit") or "").lower()
+        days = num * 7 if "week" in unit else num
+        days = max(1, days)
+        return (date.today() + timedelta(days=days)).isoformat()
+
     def _clear_programme_flow_state(self, user_id: int, channel_id: int) -> None:
         pending = self._get_pending_program(user_id, channel_id)
         if pending:
@@ -296,12 +332,12 @@ class ProgrammeCog(commands.Cog):
         channel: discord.abc.Messageable,
         text: str,
         *,
+        user_id: Optional[str] = None,
         program_id: Optional[int] = None,
         allow_implicit: bool = False,
-        user_id: Optional[int] = None,
     ) -> bool:
         if program_id is None:
-            active = await self.db.get_active_program()
+            active = await self.db.get_active_program(user_id)
             if not active:
                 return False
             program_id = int(active["id"])
@@ -323,7 +359,7 @@ class ProgrammeCog(commands.Cog):
             await send_discord_text(channel, "\n".join(lines))
             return True
 
-        await self.db.set_current_day_index(idx)
+        await self.db.set_current_day_index(idx, user_id=user_id)
         logger.info("Set current_day_index to %s for user %s", idx, user_id if user_id is not None else "unknown")
         selected = next((d for d in days if int(d["day_order"]) == idx), days[idx])
         await send_discord_text(
@@ -332,14 +368,20 @@ class ProgrammeCog(commands.Cog):
         )
         return True
 
-    async def _handle_simple_edit_request(self, channel: discord.abc.Messageable, text: str) -> bool:
+    async def _handle_simple_edit_request(
+        self,
+        channel: discord.abc.Messageable,
+        text: str,
+        *,
+        user_id: str,
+    ) -> bool:
         lowered = text.lower().strip()
 
         swap_match = re.search(r"(?:swap|replace)\s+(.+?)\s+with\s+(.+)$", text, re.IGNORECASE)
         if swap_match:
             old_name = swap_match.group(1).strip(" .")
             new_name = swap_match.group(2).strip(" .")
-            rows = await self.db.update_exercise_name_in_active_program(old_name, new_name)
+            rows = await self.db.update_exercise_name_in_active_program(old_name, new_name, user_id=user_id)
             if rows > 0:
                 await send_discord_text(channel, f"✅ Updated exercise: **{old_name}** -> **{new_name}**.")
             else:
@@ -351,12 +393,12 @@ class ProgrammeCog(commands.Cog):
             old_name = change_match.group(1).strip(" .")
             new_name = change_match.group(2).strip(" .")
 
-            day_rows = await self.db.rename_program_day_in_active_program(old_name, new_name)
+            day_rows = await self.db.rename_program_day_in_active_program(old_name, new_name, user_id=user_id)
             if day_rows > 0:
                 await send_discord_text(channel, f"✅ Renamed day: **{old_name}** -> **{new_name}**.")
                 return True
 
-            ex_rows = await self.db.update_exercise_name_in_active_program(old_name, new_name)
+            ex_rows = await self.db.update_exercise_name_in_active_program(old_name, new_name, user_id=user_id)
             if ex_rows > 0:
                 await send_discord_text(channel, f"✅ Renamed exercise: **{old_name}** -> **{new_name}**.")
             else:
@@ -367,7 +409,7 @@ class ProgrammeCog(commands.Cog):
             return True
 
         if EDIT_INTENT_RE.search(lowered):
-            active = await self.db.get_active_program()
+            active = await self.db.get_active_program(user_id)
             if not active:
                 await send_discord_text(channel, "No active program to edit yet.")
                 return True
@@ -558,6 +600,50 @@ class ProgrammeCog(commands.Cog):
         self._set_pending_program(state)
         await self._send_day_reviews(channel, day_reviews, updated=False)
 
+    async def _start_travel_pending_program(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        *,
+        travel_note: str,
+    ) -> bool:
+        user_id = str(author.id)
+        active = await self.db.get_active_program(user_id)
+        if not active:
+            await send_discord_text(channel, "No active program to adapt yet. Paste a program first.")
+            return False
+        base_text = await self._program_to_text(int(active["id"]))
+        expires_at = self._extract_travel_expiry(travel_note)
+        self._cancel_review_task(author.id, getattr(channel, "id", 0))
+        state = PendingProgram(
+            user_id=author.id,
+            channel_id=getattr(channel, "id", 0),
+            raw_text=base_text,
+            created_at=self._now_utc(),
+            notes=[travel_note],
+            temporary=True,
+            parent_program_id=int(active["id"]),
+            expires_at=expires_at,
+        )
+        self._set_pending_program(state)
+        day_reviews = await self._suggest_pending_changes_by_day(state)
+        if not self._is_pending_flow_active(state):
+            return False
+        state.latest_suggestions = "\n\n".join(day_reviews)
+        self._set_pending_program(state)
+        await self._send_day_reviews(channel, day_reviews, updated=False)
+        if expires_at:
+            await send_discord_text(
+                channel,
+                f"This will save as a temporary travel program until **{expires_at}** once you reply `save`.",
+            )
+        else:
+            await send_discord_text(
+                channel,
+                "Reply with expected duration (for example `2 weeks`) if you want auto-revert by date.",
+            )
+        return True
+
     async def _finalize_pending_program(
         self,
         channel: discord.abc.Messageable,
@@ -579,7 +665,8 @@ class ProgrammeCog(commands.Cog):
             final_text,
             str(parsed.get("program_name") or ""),
         )
-        recent = await self.db.get_recent_program_by_name(parsed["program_name"], minutes=5)
+        user_id = str(author.id)
+        recent = await self.db.get_recent_program_by_name(parsed["program_name"], user_id=user_id, minutes=5)
         if recent:
             self._mark_flow_closed(state.user_id, state.channel_id, state.flow_id)
             self._clear_pending_program(state.user_id, state.channel_id)
@@ -591,7 +678,13 @@ class ProgrammeCog(commands.Cog):
             await self._start_day_prompt(channel, int(recent["id"]))
             return
 
-        program_id = await self.db.create_program_from_payload(parsed)
+        program_id = await self.db.create_program_from_payload(
+            parsed,
+            user_id=user_id,
+            temporary=state.temporary,
+            parent_program_id=state.parent_program_id,
+            expires_at=state.expires_at,
+        )
 
         days = parsed.get("days", [])
         total_exercises = sum(len(day.get("exercises", [])) for day in days)
@@ -657,7 +750,7 @@ class ProgrammeCog(commands.Cog):
         *,
         user_id: int,
     ) -> None:
-        active = await self.db.get_active_program()
+        active = await self.db.get_active_program(str(user_id))
         if not active:
             await send_discord_text(channel, "No active program yet. Paste one to get started.")
             return
@@ -703,7 +796,8 @@ class ProgrammeCog(commands.Cog):
 
     @commands.command(name="program")
     async def show_program_command(self, ctx: commands.Context) -> None:
-        program = await self.db.get_active_program()
+        user_id = str(ctx.author.id)
+        program = await self.db.get_active_program(user_id)
         if not program:
             await send_discord_text(ctx.channel, "No active program yet. Paste one in #programme.")
             return
@@ -728,9 +822,9 @@ class ProgrammeCog(commands.Cog):
             handled = await self._handle_start_day_message(
                 ctx.channel,
                 f"start on {text}",
+                user_id=str(ctx.author.id),
                 program_id=int(context["program_id"]) if context else None,
                 allow_implicit=bool(context),
-                user_id=ctx.author.id,
             )
             if not handled:
                 await send_discord_text(ctx.channel, "Couldn't parse that day selection. Try `!startday Day 3` or `!startday Legs`.")
@@ -747,44 +841,15 @@ class ProgrammeCog(commands.Cog):
         if not self._is_programme_channel(ctx.channel):
             return
 
-        active = await self.db.get_active_program()
-        if not active:
-            await send_discord_text(ctx.channel, "You need an active base program first.")
-            return
-
-        duration_days = 14
-        match = DURATION_RE.search(text)
-        if match:
-            num = int(match.group("num"))
-            unit = match.group("unit").lower()
-            duration_days = num * 7 if "week" in unit else num
-
-        expires = (date.today() + timedelta(days=duration_days)).isoformat()
-        prompt = (
-            "Create a temporary workout program in JSON with this schema: "
-            '{"program_name":str,"days":[{"day_order":0,"name":str,"exercises":[{"name":str,"sets":int,'
-            '"rep_range_low":int|null,"rep_range_high":int|null,"category":str,"superset_group":int|null,'
-            '"muscle_groups":str,"notes":str}]}]}. '
-            f"Context: {text}. Keep 3-5 days cycle and use available equipment."
-        )
-        parsed = await self.bot.ollama.chat_json(
-            system=f"{FITNESS_ONLY_GUARDRAIL}\nReturn only valid JSON workout program.",
-            user=prompt,
-            temperature=0.2,
-        )
-
-        program_id = await self.db.create_program_from_payload(
-            parsed,
-            temporary=True,
-            parent_program_id=active["id"],
-            expires_at=expires,
-        )
-        await send_discord_text(
-            ctx.channel,
-            f"✅ Temporary program activated (ID {program_id}) until {expires}. "
-            f"Base program: **{active['name']}** will resume automatically.",
-        )
-        self._set_post_import_context(ctx.author.id, ctx.channel.id, int(program_id))
+        lock = self._get_user_lock(ctx.author.id)
+        async with lock:
+            started = await self._start_travel_pending_program(
+                ctx.channel,
+                ctx.author,
+                travel_note=text,
+            )
+            if not started:
+                return
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -805,6 +870,24 @@ class ProgrammeCog(commands.Cog):
             self.memory.append(user_id=user_id, channel_id=channel_id, role="user", content=content)
 
             pending = self._get_pending_program(user_id, channel_id)
+
+            if BACK_INTENT_RE.search(content):
+                reverted = await self.db.revert_from_temporary_program(str(user_id))
+                if reverted:
+                    active = await self.db.get_active_program(str(user_id))
+                    if active:
+                        day_index = await self.db.get_current_day_index(str(user_id))
+                        day = await self.db.get_day_for_index(day_index, user_id=str(user_id))
+                        day_name = str(day["name"]) if day else f"Day {day_index + 1}"
+                        await send_discord_text(
+                            message.channel,
+                            f"Welcome back! Reverted to **{active['name']}**. You left off on {day_name} (Day {day_index + 1}).",
+                        )
+                    else:
+                        await send_discord_text(message.channel, "Welcome back! Reverted to your base program.")
+                else:
+                    await send_discord_text(message.channel, "No active temporary travel program found.")
+                return
 
             if self._looks_like_program_paste(content):
                 try:
@@ -850,12 +933,21 @@ class ProgrammeCog(commands.Cog):
                         self.review_tasks.pop(key, None)
                 return
 
+            if TRAVEL_INTENT_RE.search(content):
+                started = await self._start_travel_pending_program(
+                    message.channel,
+                    message.author,
+                    travel_note=content,
+                )
+                if started:
+                    return
+
             handled_start_day = await self._handle_start_day_message(
                 message.channel,
                 content,
+                user_id=str(user_id),
                 program_id=int(context["program_id"]) if context else None,
                 allow_implicit=bool(context),
-                user_id=user_id,
             )
             if handled_start_day:
                 if context:
@@ -866,7 +958,7 @@ class ProgrammeCog(commands.Cog):
                     )
                 return
 
-            if await self._handle_simple_edit_request(message.channel, content):
+            if await self._handle_simple_edit_request(message.channel, content, user_id=str(user_id)):
                 return
 
             await self._reply_programme_message(message.channel, content, user_id=user_id)

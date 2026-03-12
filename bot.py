@@ -61,8 +61,7 @@ class PTBot(commands.Bot):
         logging.info("Loaded all cogs")
 
     async def _clear_runtime_cog_state_if_fresh_db(self) -> None:
-        active = await self.db.get_active_program()
-        if active:
+        if await self.db.has_any_program():
             return
         for cog_name in ("ProgrammeCog", "AskCog", "CheckInCog"):
             cog = self.get_cog(cog_name)
@@ -85,6 +84,8 @@ class PTBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logging.info("Logged in as %s (%s)", self.user, getattr(self.user, "id", "?"))
+        logging.info("PRS channel ID from config: %s", self.settings.prs_channel_id)
+        logging.info("PRs cog loaded: %s", self.get_cog("PRsCog") is not None)
         if self._startup_notified:
             return
         self._startup_notified = True
@@ -105,7 +106,7 @@ class PTBot(commands.Bot):
         version = match.group("version").strip()
         date_label = match.group("date").strip()
         body = match.group("body").strip()
-        section = f"## [{version}] - {date_label}\\n{body}".strip()
+        section = f"## [{version}] - {date_label}\n{body}".strip()
         return version, section
 
     def _read_last_posted_version(self) -> str:

@@ -2,6 +2,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS programs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     name TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     active BOOLEAN DEFAULT 1,
@@ -42,6 +43,7 @@ ON exercises(program_day_id, display_order);
 
 CREATE TABLE IF NOT EXISTS workout_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     exercise_id INTEGER NOT NULL,
     date DATE NOT NULL,
     set_number INTEGER NOT NULL,
@@ -58,6 +60,7 @@ ON workout_logs(exercise_id, date);
 
 CREATE TABLE IF NOT EXISTS activity_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     date DATE NOT NULL,
     activity_type TEXT NOT NULL,
     description TEXT,
@@ -67,6 +70,7 @@ CREATE TABLE IF NOT EXISTS activity_logs (
 
 CREATE TABLE IF NOT EXISTS injuries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     date DATE NOT NULL,
     description TEXT NOT NULL,
     muscle_groups TEXT,
@@ -80,6 +84,7 @@ ON injuries(active, date);
 
 CREATE TABLE IF NOT EXISTS personal_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     exercise_name TEXT NOT NULL,
     weight REAL NOT NULL,
     reps INTEGER NOT NULL,
@@ -95,13 +100,15 @@ ON personal_records(exercise_name);
 
 CREATE TABLE IF NOT EXISTS exercise_cues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     exercise_name TEXT NOT NULL,
     cue TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS user_state (
-    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL UNIQUE,
     current_program_id INTEGER,
     current_day_index INTEGER DEFAULT 0,
     phase TEXT DEFAULT 'maintain',
@@ -118,6 +125,7 @@ CREATE TABLE IF NOT EXISTS user_state (
 
 CREATE TABLE IF NOT EXISTS workout_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
     session_date DATE NOT NULL,
     channel_id INTEGER NOT NULL,
     day_id INTEGER NOT NULL,

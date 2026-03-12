@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from typing import Any, Optional
 
@@ -8,6 +9,9 @@ from discord.ext import commands
 
 from utils.discord_messages import send_discord_text
 from utils.numbers import format_standard_number
+
+
+logger = logging.getLogger(__name__)
 
 
 class PRsCog(commands.Cog):
@@ -21,6 +25,16 @@ class PRsCog(commands.Cog):
             channel = self.bot.get_channel(self.settings.prs_channel_id)
             if isinstance(channel, discord.TextChannel):
                 return channel
+            try:
+                fetched = await self.bot.fetch_channel(self.settings.prs_channel_id)
+                if isinstance(fetched, discord.TextChannel):
+                    return fetched
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch PR channel id=%s: %s",
+                    self.settings.prs_channel_id,
+                    exc,
+                )
 
         for guild in self.bot.guilds:
             for channel in guild.text_channels:
@@ -30,12 +44,28 @@ class PRsCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_pr_hit(self, payload: dict[str, Any]) -> None:
+        logger.info(
+            "on_pr_hit payload: exercise=%s first=%s e1rm=%s performer_id=%s",
+            payload.get("exercise_name"),
+            payload.get("is_first_benchmark"),
+            payload.get("e1rm"),
+            payload.get("performer_user_id"),
+        )
         channel = await self._get_pr_channel()
         if not channel:
+            logger.warning("PR event dropped: PRs channel could not be resolved.")
             return
 
+        logger.info("Posting PR update to channel id=%s", channel.id)
+
+        performer_user_id = str(payload.get("performer_user_id") or "").strip()
         performer = str(payload.get("performer_name") or "").strip()
-        performer_prefix = f"{performer} " if performer else ""
+        if performer_user_id:
+            performer_prefix = f"<@{performer_user_id}> "
+        elif performer:
+            performer_prefix = f"{performer} "
+        else:
+            performer_prefix = ""
 
         if payload.get("is_first_benchmark"):
             lines = [
@@ -70,7 +100,7 @@ class PRsCog(commands.Cog):
 
     @commands.command(name="prs")
     async def prs_command(self, ctx: commands.Context, days: int = 14) -> None:
-        rows = await self.db.get_recent_prs(max(1, min(90, days)))
+        rows = await self.db.get_recent_prs(max(1, min(90, days)), user_id=str(ctx.author.id))
         if not rows:
             await send_discord_text(ctx.channel, "No PRs in that window.")
             return
