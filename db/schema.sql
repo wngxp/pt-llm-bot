@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS activity_logs (
     muscle_groups TEXT
 );
 
+CREATE TABLE IF NOT EXISTS injuries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date DATE NOT NULL,
+    description TEXT NOT NULL,
+    muscle_groups TEXT,
+    severity TEXT DEFAULT 'moderate',
+    active BOOLEAN DEFAULT 1,
+    resolved_date DATE
+);
+
+CREATE INDEX IF NOT EXISTS idx_injuries_active
+ON injuries(active, date);
+
 CREATE TABLE IF NOT EXISTS personal_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     exercise_name TEXT NOT NULL,

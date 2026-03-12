@@ -2,17 +2,30 @@
 ### Fixed
 - Relaxed prompt guardrails so fitness-adjacent requests (equipment swaps, nutrition/recovery topics) are answered normally while still declining prompt-injection attempts.
 - `#programme` no longer auto-imports pasted programs; it now stages draft analysis, suggests swaps, and imports only after user confirmation (`save`).
+- `#programme` now clears pending/import flow state correctly after save + day selection to prevent duplicate re-import loops.
+- `#programme` day selection handling is now separated from edit flow so `start on legs` sets `current_day_index` instead of mutating program structure.
+- Duplicate import guard added: same program name imported within 5 minutes is blocked.
+- Pre-import review now includes extracted exercise categories and applies stricter Smith-machine swap guidance (barbell categories only).
+- Parser now handles complex schemes like `3x(8, 5, 12)` and `3x(5+15)` so those exercises are not silently dropped.
 - Increased `#ask` response budget (`max_tokens=300`) to avoid cut-off replies.
+- `#ask` gating tightened: bot only answers mentions/replies or fitness-related questions.
+- Added `#ask` output safety filter to block off-topic recipe/code-style outputs from being sent.
 - Fixed early-exit `move on` loop by normalizing input, accepting broader move-on variants, and correcting decision-branch handling.
 - Added early-exit timeout handling (60s) that auto-resumes instead of leaving users stuck.
 - Improved early-exit copy for zero-completion sessions (`No exercises completed...`) and cleaned up confirmation flow.
 - Added first-benchmark announcement for first-ever compound/bodyweight logs (for example: first Squat benchmark message).
 - Activity impact now surfaces at session start and influences overlapping exercise suggestions in the next 72 hours.
 - Readiness score now directly affects suggestions and messaging (high/normal/low/very low paths).
+- `#activity` no longer logs every message; it now logs only true activity reports and handles injury reports separately.
+- Injury reports are now stored as injuries and surfaced as skip/substitute warnings during workouts.
+- Fixed changelog startup post newline rendering (`\\n` literals no longer shown).
+- Message splitting is now enforced globally: all text sends route through splitter utility.
 
 ### Added
 - Startup changelog auto-post support with `CHANGELOG_CHANNEL_ID` and version-change dedupe via local state file.
 - New `restart.sh` script that initializes Conda correctly in non-interactive shells before launching the bot.
+- Admin/debug commands: `!reset`, `!deleteprogram`, `!setday`, `!debug` (owner/admin role restricted).
+- Workout day jump commands: `!skipday` and `!goto`.
 
 ## [0.2.0] - 2026-03-11
 ### Fixed

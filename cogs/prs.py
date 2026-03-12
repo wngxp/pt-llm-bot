@@ -6,6 +6,7 @@ from typing import Any, Optional
 import discord
 from discord.ext import commands
 
+from utils.discord_messages import send_discord_text
 from utils.numbers import format_standard_number
 
 
@@ -51,13 +52,13 @@ class PRsCog(commands.Cog):
             )
             lines.append(f"Improvement: {gain:+.1f} ({pct:+.1f}%)")
 
-        await channel.send("\n".join(lines))
+        await send_discord_text(channel, "\n".join(lines))
 
     @commands.command(name="prs")
     async def prs_command(self, ctx: commands.Context, days: int = 14) -> None:
         rows = await self.db.get_recent_prs(max(1, min(90, days)))
         if not rows:
-            await ctx.send("No PRs in that window.")
+            await send_discord_text(ctx.channel, "No PRs in that window.")
             return
 
         lines = [f"Recent PRs ({days}d):"]
@@ -67,7 +68,7 @@ class PRsCog(commands.Cog):
                 f"{format_standard_number(float(row['weight']))}{row['unit']} x {row['reps']} "
                 f"(e1RM {format_standard_number(float(row['estimated_1rm']))})"
             )
-        await ctx.send("\n".join(lines))
+        await send_discord_text(ctx.channel, "\n".join(lines))
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import discord
 from discord.ext import commands
+
+from utils.discord_messages import send_discord_text
 
 
 BOT_VERSION = "0.3.0"
@@ -11,6 +15,8 @@ class UtilityCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.settings = bot.settings
+        self.db = bot.db
+        self.pending_confirms: dict[tuple[int, str], datetime] = {}
 
     def _settings_channel_ref(self, channel: discord.abc.Messageable) -> str | None:
         settings_id = self.settings.settings_channel_id
@@ -28,27 +34,184 @@ class UtilityCog(commands.Cog):
     async def _maybe_send_tip(self, channel: discord.abc.Messageable) -> None:
         ref = self._settings_channel_ref(channel)
         if ref:
-            await channel.send(f"Tip: use {ref} for utility commands like this.")
+            await send_discord_text(channel, f"Tip: use {ref} for utility commands like this.")
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _is_admin(self, ctx: commands.Context) -> bool:
+        if not ctx.guild:
+            return False
+        if ctx.guild.owner_id == ctx.author.id:
+            return True
+        role_id = self.settings.admin_role_id
+        if role_id and isinstance(ctx.author, discord.Member):
+            return any(r.id == role_id for r in ctx.author.roles)
+        return False
+
+    async def _require_admin(self, ctx: commands.Context) -> bool:
+        if self._is_admin(ctx):
+            return True
+        await send_discord_text(ctx.channel, "This command is restricted to the server owner/admin role.")
+        return False
+
+    def _start_confirm(self, user_id: int, action: str) -> None:
+        self.pending_confirms[(user_id, action)] = self._now() + timedelta(seconds=60)
+
+    def _consume_confirm(self, user_id: int, action: str) -> bool:
+        key = (user_id, action)
+        expires = self.pending_confirms.get(key)
+        if not expires:
+            return False
+        if expires < self._now():
+            self.pending_confirms.pop(key, None)
+            return False
+        self.pending_confirms.pop(key, None)
+        return True
+
+    async def _clear_active_workout_sessions(self) -> None:
+        workout_cog = self.bot.get_cog("WorkoutCog")
+        if workout_cog is None:
+            return
+        sessions = getattr(workout_cog, "sessions", None)
+        if isinstance(sessions, dict):
+            sessions.clear()
+        early_prompts = getattr(workout_cog, "early_end_prompts", None)
+        if isinstance(early_prompts, dict):
+            early_prompts.clear()
+        timeout_tasks = getattr(workout_cog, "early_end_timeout_tasks", None)
+        if isinstance(timeout_tasks, dict):
+            for task in timeout_tasks.values():
+                if hasattr(task, "done") and not task.done():
+                    task.cancel()
+            timeout_tasks.clear()
 
     @commands.command(name="version")
     async def version_command(self, ctx: commands.Context) -> None:
-        await ctx.send(f"PT-LLM Bot v{BOT_VERSION}")
+        await send_discord_text(ctx.channel, f"PT-LLM Bot v{BOT_VERSION}")
         await self._maybe_send_tip(ctx.channel)
 
-    @commands.command(name="help")
+    @commands.command(name="help", aliases=["pthelp"])
     async def help_command(self, ctx: commands.Context) -> None:
         lines = [
-            "Core commands:",
-            "- Workout-only: `ready`, `skip rest`, set logs like `225 x 3`",
-            "- Utility (global): `!timezone`, `!volume`, `!e1rm`, `!export`, `!cue`, `!plates`, `!help`",
-            "- `!start` / `!done` in workout channels",
-            "- !plates <weight> [lbs|kg]",
-            "- !e1rm <exercise>",
-            "- !checkin / !summary in #check-in",
-            "- !version",
+            "**PT-LLM Command Guide**",
+            "",
+            "**Workout**",
+            "- `ready` - start today's workout",
+            "- `[weight] x [reps]` - log a set (for example `225 x 3`, `80 kg x 5`, `bw x 10`, `bw+25 x 8`)",
+            "- `@[rir]` - add RIR after a set (for example `225 x 3 @1`)",
+            "- `skip rest` - skip the rest timer",
+            "- `im done` / `stop` - end session early",
+            "- `resume` / `move on` - after ending early",
+            "",
+            "**Program**",
+            "- Paste a program in `#programme` to import (bot will discuss first)",
+            "- `save` - confirm and import after discussion",
+            "- `cancel` - discard pending program",
+            "",
+            "**Stats**",
+            "- `!volume` - weekly sets per muscle group",
+            "- `!e1rm [exercise]` - estimated 1RM history",
+            "- `!plates [weight]` - plate breakdown",
+            "- `!export` - download training logs as CSV",
+            "",
+            "**Settings**",
+            "- `!timezone [tz]` - set timezone (for example `!timezone Asia/Shanghai`)",
+            "- `!cue [exercise] [text]` - save a form cue",
+            "",
+            "**Admin**",
+            "- `!reset` - wipe all workout data (with confirmation)",
+            "- `!deleteprogram` - delete current program",
+            "- `!setday [n]` - set current day index",
+            "- `!skipday [n]` - skip to a specific program day",
+            "- `!debug` - show current bot state",
+            "- `!version` - show bot version",
+            "",
+            "**Info**",
+            "- `!help` - show this command list",
+            "- `!summary` / `!checkin` - weekly summary (in `#check-in`)",
         ]
-        await ctx.send("\n".join(lines))
+        await send_discord_text(ctx.channel, "\n".join(lines))
         await self._maybe_send_tip(ctx.channel)
+
+    @commands.command(name="debug")
+    async def debug_command(self, ctx: commands.Context) -> None:
+        if not await self._require_admin(ctx):
+            return
+        state = await self.db.get_user_state()
+        program = await self.db.get_active_program()
+        program_name = str(program["name"]) if program else "None"
+        lines = [
+            "Debug state:",
+            f"- active_program: {program_name}",
+            f"- current_day_index: {state.get('current_day_index', 0)}",
+            f"- readiness: {state.get('readiness', 7)}",
+            f"- streak: {state.get('current_streak', 0)} (longest {state.get('longest_streak', 0)})",
+            f"- last_workout_date: {state.get('last_workout_date') or 'None'}",
+            f"- phase: {state.get('phase', 'maintain')}",
+            f"- timezone: {state.get('timezone', 'UTC')}",
+        ]
+        await send_discord_text(ctx.channel, "\n".join(lines))
+
+    @commands.command(name="setday")
+    async def setday_command(self, ctx: commands.Context, day_number: int) -> None:
+        if not await self._require_admin(ctx):
+            return
+        active = await self.db.get_active_program()
+        if not active:
+            await send_discord_text(ctx.channel, "No active program.")
+            return
+        days = await self.db.get_program_days(int(active["id"]))
+        if not days:
+            await send_discord_text(ctx.channel, "Active program has no days.")
+            return
+        idx = day_number - 1
+        if idx < 0 or idx >= len(days):
+            await send_discord_text(ctx.channel, f"Day must be between 1 and {len(days)}.")
+            return
+        await self.db.set_current_day_index(idx)
+        await send_discord_text(ctx.channel, f"Set current day to Day {day_number} - {days[idx]['name']}.")
+
+    @commands.command(name="reset")
+    async def reset_command(self, ctx: commands.Context, confirm: str = "") -> None:
+        if not await self._require_admin(ctx):
+            return
+        if confirm.strip().lower() == "confirm":
+            if not self._consume_confirm(ctx.author.id, "reset"):
+                await send_discord_text(ctx.channel, "Reset confirmation expired. Run `!reset` again.")
+                return
+            await self.db.wipe_workout_data_preserve_settings()
+            await self._clear_active_workout_sessions()
+            await send_discord_text(ctx.channel, "All workout data wiped. Timezone/settings were preserved.")
+            return
+        self._start_confirm(ctx.author.id, "reset")
+        await send_discord_text(
+            ctx.channel,
+            "This will wipe workout logs, activities, PRs, injuries, and streak data. "
+            "Run `!reset confirm` within 60 seconds to proceed.",
+        )
+
+    @commands.command(name="deleteprogram")
+    async def deleteprogram_command(self, ctx: commands.Context, confirm: str = "") -> None:
+        if not await self._require_admin(ctx):
+            return
+        if confirm.strip().lower() == "confirm":
+            if not self._consume_confirm(ctx.author.id, "deleteprogram"):
+                await send_discord_text(ctx.channel, "Delete confirmation expired. Run `!deleteprogram` again.")
+                return
+            ok = await self.db.delete_active_program()
+            await self._clear_active_workout_sessions()
+            if ok:
+                await send_discord_text(ctx.channel, "Active program deleted.")
+            else:
+                await send_discord_text(ctx.channel, "No active program to delete.")
+            return
+        self._start_confirm(ctx.author.id, "deleteprogram")
+        await send_discord_text(
+            ctx.channel,
+            "This will delete the active program and its linked exercises/logs. "
+            "Run `!deleteprogram confirm` within 60 seconds to proceed.",
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

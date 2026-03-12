@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 
 REP_RANGE_RE = re.compile(r"(?P<sets>\d+)\s*[xX×]\s*(?P<low>\d+)(?:\s*[-–]\s*(?P<high>\d+))?")
+COMPLEX_SCHEME_RE = re.compile(r"(?P<sets>\d+)\s*[xX×]\s*\((?P<scheme>[^)]+)\)")
 DAY_HEADER_RE = re.compile(
     r"^(?:day\s*\d+\b.*|(?:push|pull|legs?|upper|lower)\b(?:\s*day)?\b.*)$",
     re.IGNORECASE,
@@ -20,11 +21,72 @@ BULLET_PREFIX_RE = re.compile(r"^(?:[-*•]+|\d+[\).])\s*")
 NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 KNOWN_CATEGORY_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
-    (("romanian deadlift", "rdl", "pause squat", "larsen", "sldl", "ez-bar curl", "ez bar curl"), "light_barbell"),
-    (("back squat", "front squat", "squat", "bench press", "deadlift", "overhead press", "ohp", "barbell row"), "heavy_barbell"),
+    (
+        (
+            "romanian deadlift",
+            "rdl",
+            "pause squat",
+            "larsen",
+            "sldl",
+            "stiff leg deadlift",
+            "close-grip incline press",
+            "close grip incline press",
+            "close-grip incline",
+            "close grip incline",
+            "ez-bar curl",
+            "ez bar curl",
+        ),
+        "light_barbell",
+    ),
+    (
+        (
+            "back squat",
+            "front squat",
+            "squat",
+            "bench press",
+            "close-grip bench",
+            "close grip bench",
+            "deadlift",
+            "overhead press",
+            "ohp",
+            "barbell row",
+            "incline bench",
+        ),
+        "heavy_barbell",
+    ),
     (("pull-up", "pull up", "chin-up", "chin up", "push-up", "push up", "dip"), "bodyweight"),
-    (("lat pulldown", "pulldown", "leg press", "machine", "cable", "row machine", "leg curl", "leg extension"), "cable_machine"),
-    (("dumbbell", "db ", " db"), "dumbbell"),
+    (
+        (
+            "lat pulldown",
+            "pulldown",
+            "leg press",
+            "machine",
+            "cable",
+            "row machine",
+            "leg curl",
+            "leg extension",
+            "y-raise",
+            "y raise",
+            "y-raises",
+            "y raises",
+            "seated leg curl",
+        ),
+        "cable_machine",
+    ),
+    (
+        (
+            "dumbbell",
+            "db press",
+            "db row",
+            "arnold press",
+            "arnold shoulder press",
+            "arnold",
+            "kroc row",
+            "lateral raise",
+            "lateral raises",
+        ),
+        "dumbbell",
+    ),
 ]
 
 VALID_CATEGORIES = {"heavy_barbell", "light_barbell", "dumbbell", "cable_machine", "bodyweight"}
@@ -132,10 +194,14 @@ class ProgramParser:
                 sets = int(ex.get("sets") or 1)
                 low = ex.get("rep_range_low")
                 high = ex.get("rep_range_high")
+                notes = str(ex.get("notes") or "").strip()
                 if not name:
                     continue
                 if low is None or high is None:
-                    lines.append(f"{name} - {sets}xAMRAP")
+                    if notes:
+                        lines.append(f"{name} - {sets}x({notes})")
+                    else:
+                        lines.append(f"{name} - {sets}xAMRAP")
                 elif low == high:
                     lines.append(f"{name} - {sets}x{low}")
                 else:
@@ -529,9 +595,16 @@ class ProgramParser:
 
     def _category_lookup(self, name: str, fallback: str = "") -> str:
         lower_name = name.lower()
+        normalized_name = NON_ALNUM_RE.sub("", lower_name)
         for keywords, category in KNOWN_CATEGORY_KEYWORDS:
-            if any(keyword in lower_name for keyword in keywords):
-                return category
+            for keyword in keywords:
+                key = keyword.lower()
+                if key in lower_name:
+                    return category
+                normalized_key = NON_ALNUM_RE.sub("", key)
+                # Avoid ultra-short token collisions (for example, "db").
+                if len(normalized_key) >= 4 and normalized_key in normalized_name:
+                    return category
         if fallback in VALID_CATEGORIES:
             return fallback
         return "cable_machine"
@@ -624,7 +697,7 @@ class ProgramParser:
         cleaned = BULLET_PREFIX_RE.sub("", line).strip("-: ")
         if not cleaned:
             return None
-        if REP_RANGE_RE.search(cleaned) or "amrap" in cleaned.lower():
+        if REP_RANGE_RE.search(cleaned) or COMPLEX_SCHEME_RE.search(cleaned) or "amrap" in cleaned.lower():
             return None
         if len(cleaned.split()) > 8:
             return None
@@ -649,6 +722,35 @@ class ProgramParser:
                 "rep_range_low": None,
                 "rep_range_high": None,
                 "notes": "AMRAP",
+            }
+
+        complex_match = COMPLEX_SCHEME_RE.search(cleaned)
+        if complex_match:
+            sets = int(complex_match.group("sets"))
+            scheme = complex_match.group("scheme").strip()
+            name = cleaned[: complex_match.start()].strip(" -–:")
+            if not name:
+                tail = cleaned[complex_match.end() :].strip(" -–:")
+                name = tail
+            if not name:
+                return None
+
+            scheme_low = scheme.lower().replace(" ", "")
+            if "," in scheme:
+                notes = f"varying reps: {scheme}"
+            elif "+" in scheme_low:
+                if scheme_low == "5+15":
+                    notes = "5 eccentric + 15 constant tension"
+                else:
+                    notes = f"special rep scheme: {scheme}"
+            else:
+                notes = f"rep scheme: {scheme}"
+            return {
+                "name": name,
+                "sets": sets,
+                "rep_range_low": None,
+                "rep_range_high": None,
+                "notes": notes,
             }
 
         scheme = REP_RANGE_RE.search(cleaned)

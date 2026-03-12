@@ -237,6 +237,25 @@ class Database:
             await conn.commit()
             return int(program_id)
 
+    async def get_recent_program_by_name(self, name: str, *, minutes: int = 5) -> Optional[dict[str, Any]]:
+        cleaned = name.strip()
+        if not cleaned:
+            return None
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT *
+                FROM programs
+                WHERE LOWER(name) = LOWER(?)
+                  AND created_at >= datetime('now', ?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (cleaned, f"-{max(1, minutes)} minutes"),
+            )
+        return dict(row) if row else None
+
     async def get_program_days(self, program_id: int) -> list[dict[str, Any]]:
         async with self.connect() as conn:
             rows = await self._fetchall(conn, 
@@ -444,6 +463,61 @@ class Database:
             )
             await conn.commit()
         return int(cursor.lastrowid)
+
+    async def add_injury(
+        self,
+        *,
+        injury_date: date,
+        description: str,
+        muscle_groups: str,
+        severity: str = "moderate",
+    ) -> int:
+        async with self.connect() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO injuries (date, description, muscle_groups, severity, active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (injury_date.isoformat(), description, muscle_groups, severity),
+            )
+            await conn.commit()
+        return int(cursor.lastrowid)
+
+    async def get_active_injuries(self) -> list[dict[str, Any]]:
+        async with self.connect() as conn:
+            rows = await self._fetchall(
+                conn,
+                """
+                SELECT *
+                FROM injuries
+                WHERE active = 1
+                ORDER BY date DESC, id DESC
+                """,
+            )
+        return [dict(r) for r in rows]
+
+    async def resolve_injuries(self, *, muscle_group: Optional[str] = None) -> int:
+        async with self.connect() as conn:
+            if muscle_group:
+                cursor = await conn.execute(
+                    """
+                    UPDATE injuries
+                    SET active = 0, resolved_date = ?
+                    WHERE active = 1 AND LOWER(muscle_groups) LIKE ?
+                    """,
+                    (date.today().isoformat(), f"%{muscle_group.lower()}%"),
+                )
+            else:
+                cursor = await conn.execute(
+                    """
+                    UPDATE injuries
+                    SET active = 0, resolved_date = ?
+                    WHERE active = 1
+                    """,
+                    (date.today().isoformat(),),
+                )
+            await conn.commit()
+        return int(cursor.rowcount or 0)
 
     async def get_activities_last_7_days(self) -> list[dict[str, Any]]:
         threshold = (date.today() - timedelta(days=7)).isoformat()
@@ -660,6 +734,74 @@ class Database:
                 (threshold,),
             )
         return [dict(r) for r in rows]
+
+    async def wipe_workout_data_preserve_settings(self) -> None:
+        async with self.connect() as conn:
+            await conn.execute("DELETE FROM workout_logs")
+            await conn.execute("DELETE FROM activity_logs")
+            await conn.execute("DELETE FROM personal_records")
+            await conn.execute("DELETE FROM exercise_cues")
+            await conn.execute("DELETE FROM injuries")
+            await conn.execute("DELETE FROM workout_sessions")
+            await conn.execute(
+                """
+                UPDATE user_state
+                SET current_streak = 0,
+                    longest_streak = 0,
+                    last_workout_date = NULL,
+                    last_checkin_date = NULL,
+                    current_day_index = 0
+                WHERE id = 1
+                """
+            )
+            await conn.commit()
+
+    async def delete_active_program(self) -> bool:
+        program = await self.get_active_program()
+        if not program:
+            return False
+        program_id = int(program["id"])
+        async with self.connect() as conn:
+            day_rows = await self._fetchall(
+                conn,
+                "SELECT id FROM program_days WHERE program_id = ?",
+                (program_id,),
+            )
+            day_ids = [int(r["id"]) for r in day_rows]
+            ex_ids: list[int] = []
+            if day_ids:
+                placeholders = ",".join("?" for _ in day_ids)
+                ex_rows = await self._fetchall(
+                    conn,
+                    f"SELECT id FROM exercises WHERE program_day_id IN ({placeholders})",
+                    day_ids,
+                )
+                ex_ids = [int(r["id"]) for r in ex_rows]
+
+            if ex_ids:
+                placeholders = ",".join("?" for _ in ex_ids)
+                await conn.execute(
+                    f"DELETE FROM workout_logs WHERE exercise_id IN ({placeholders})",
+                    ex_ids,
+                )
+
+            if day_ids:
+                placeholders = ",".join("?" for _ in day_ids)
+                await conn.execute(
+                    f"DELETE FROM exercises WHERE program_day_id IN ({placeholders})",
+                    day_ids,
+                )
+                await conn.execute(
+                    f"DELETE FROM program_days WHERE id IN ({placeholders})",
+                    day_ids,
+                )
+
+            await conn.execute("DELETE FROM programs WHERE id = ?", (program_id,))
+            await conn.execute(
+                "UPDATE user_state SET current_program_id = NULL, current_day_index = 0 WHERE id = 1"
+            )
+            await conn.commit()
+        return True
 
     async def mark_workout_completed(self, workout_date: date) -> dict[str, int]:
         state = await self.get_user_state()

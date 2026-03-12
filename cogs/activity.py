@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -8,6 +9,36 @@ import discord
 from discord.ext import commands
 
 from llm.prompts import ACTIVITY_IMPACT_SYSTEM_PROMPT
+from utils.discord_messages import send_discord_text
+
+
+ACTIVITY_VERB_RE = re.compile(
+    r"\b(ran|run|running|played|play|went|did|climbed|hiked|swam|cycled|biked|walked|jogged|lifted|trained)\b",
+    re.IGNORECASE,
+)
+ACTIVITY_DESCRIPTOR_RE = re.compile(
+    r"(\b\d+\s*(?:min|mins|minute|minutes|hr|hrs|hour|hours|km|k|mile|miles)\b|\b(hard|easy|moderate|intense|light|long)\b)",
+    re.IGNORECASE,
+)
+INJURY_RE = re.compile(
+    r"\b(injured|injury|tore|torn|broken|sprained|strained|hurt|pain|ache|tweaked)\b",
+    re.IGNORECASE,
+)
+MUSCLE_KEYWORDS: dict[str, str] = {
+    "rotator cuff": "shoulders",
+    "shoulder": "shoulders",
+    "knee": "quads",
+    "hamstring": "hamstrings",
+    "quad": "quads",
+    "lower back": "back",
+    "back": "back",
+    "elbow": "triceps",
+    "wrist": "forearms",
+    "ankle": "calves",
+    "hip": "glutes",
+    "pec": "chest",
+    "chest": "chest",
+}
 
 
 class ActivityCog(commands.Cog):
@@ -39,7 +70,7 @@ class ActivityCog(commands.Cog):
     async def _maybe_send_settings_tip(self, channel: discord.abc.Messageable) -> None:
         ref = self._settings_channel_ref(channel)
         if ref:
-            await channel.send(f"Tip: use {ref} for utility commands like this.")
+            await send_discord_text(channel, f"Tip: use {ref} for utility commands like this.")
 
     async def _local_today(self) -> date:
         tz_name = await self.db.get_user_timezone()
@@ -48,6 +79,20 @@ class ActivityCog(commands.Cog):
         except ZoneInfoNotFoundError:
             tzinfo = ZoneInfo("UTC")
         return datetime.now(tzinfo).date()
+
+    def _looks_like_activity_report(self, text: str) -> bool:
+        return bool(ACTIVITY_VERB_RE.search(text) and ACTIVITY_DESCRIPTOR_RE.search(text))
+
+    def _looks_like_injury_report(self, text: str) -> bool:
+        return bool(INJURY_RE.search(text))
+
+    def _extract_injury_groups(self, text: str) -> str:
+        lowered = text.lower()
+        groups: set[str] = set()
+        for key, group in MUSCLE_KEYWORDS.items():
+            if key in lowered:
+                groups.add(group)
+        return ",".join(sorted(groups)) if groups else "general"
 
     def _normalize_activity_classification(self, text: str, classification: dict[str, Any]) -> dict[str, Any]:
         out = dict(classification)
@@ -122,48 +167,83 @@ class ActivityCog(commands.Cog):
                 "short_note": text,
             }
 
+    async def _handle_activity_text(self, channel: discord.abc.Messageable, content: str) -> None:
+        today_local = await self._local_today()
+
+        if self._looks_like_injury_report(content):
+            groups = self._extract_injury_groups(content)
+            await self.db.add_injury(
+                injury_date=today_local,
+                description=content,
+                muscle_groups=groups,
+                severity="high",
+            )
+            await send_discord_text(
+                channel,
+                "That sounds serious. Please consult a medical professional. "
+                f"I'll flag {groups} exercises as skip/substitute until you tell me you've recovered.",
+            )
+            return
+
+        if self._looks_like_activity_report(content):
+            classification = await self._classify_activity(content)
+            classification = self._normalize_activity_classification(content, classification)
+            await self.db.add_activity(
+                activity_date=today_local,
+                activity_type=classification["activity_type"],
+                description=content,
+                intensity=classification["intensity"],
+                muscle_groups=classification["muscle_groups"],
+            )
+            recovery_note = await self._estimate_recovery_message(
+                classification["muscle_groups"],
+                classification["intensity"],
+            )
+            await send_discord_text(
+                channel,
+                f"Logged activity on {today_local.isoformat()}: {classification['activity_type']} "
+                f"({classification['intensity']}) affecting [{classification['muscle_groups'] or 'unspecified'}].\n"
+                f"{recovery_note}",
+            )
+            return
+
+        if "?" in content:
+            await send_discord_text(
+                channel,
+                "I can log activities like `played soccer 2 hours hard` or `ran 30 min easy`. "
+                "If this is an injury update, tell me what hurts and I’ll flag it.",
+            )
+            return
+
+        await send_discord_text(
+            channel,
+            "I didn't log that as an activity. Use a format like `ran 30 min moderate` if you want it tracked.",
+        )
+
     @commands.command(name="activity")
     async def activity_command(self, ctx: commands.Context, *, description: str) -> None:
-        classification = await self._classify_activity(description)
-        classification = self._normalize_activity_classification(description, classification)
-        today_local = await self._local_today()
-        await self.db.add_activity(
-            activity_date=today_local,
-            activity_type=classification["activity_type"],
-            description=description,
-            intensity=classification["intensity"],
-            muscle_groups=classification["muscle_groups"],
-        )
-        recovery_note = await self._estimate_recovery_message(
-            classification["muscle_groups"],
-            classification["intensity"],
-        )
-        await ctx.send(
-            f"Logged activity on {today_local.isoformat()}: {classification['activity_type']} "
-            f"({classification['intensity']}) affecting [{classification['muscle_groups'] or 'unspecified'}].\n"
-            f"{recovery_note}"
-        )
+        await self._handle_activity_text(ctx.channel, description)
 
     @commands.command(name="readiness")
     async def readiness_command(self, ctx: commands.Context, score: int) -> None:
         score = max(1, min(10, score))
         await self.db.update_user_state(readiness=score)
-        await ctx.send(f"Readiness updated to {score}/10.")
+        await send_discord_text(ctx.channel, f"Readiness updated to {score}/10.")
 
     @commands.command(name="phase")
     async def phase_command(self, ctx: commands.Context, phase: str) -> None:
         phase = phase.lower().strip()
         if phase not in {"cut", "bulk", "maintain"}:
-            await ctx.send("Phase must be one of: cut, bulk, maintain.")
+            await send_discord_text(ctx.channel, "Phase must be one of: cut, bulk, maintain.")
             return
         await self.db.update_user_state(phase=phase)
-        await ctx.send(f"Phase set to {phase}.")
+        await send_discord_text(ctx.channel, f"Phase set to {phase}.")
 
     @commands.command(name="timezone")
     async def timezone_command(self, ctx: commands.Context, *, timezone_name: str = "") -> None:
         if not timezone_name.strip():
             current = await self.db.get_user_timezone()
-            await ctx.send(f"Current timezone: `{current}`")
+            await send_discord_text(ctx.channel, f"Current timezone: `{current}`")
             await self._maybe_send_settings_tip(ctx.channel)
             return
 
@@ -171,14 +251,15 @@ class ActivityCog(commands.Cog):
         try:
             ZoneInfo(candidate)
         except ZoneInfoNotFoundError:
-            await ctx.send(
-                "Invalid timezone. Use an IANA timezone like `America/New_York`, `Europe/London`, or `Asia/Shanghai`."
+            await send_discord_text(
+                ctx.channel,
+                "Invalid timezone. Use an IANA timezone like `America/New_York`, `Europe/London`, or `Asia/Shanghai`.",
             )
             await self._maybe_send_settings_tip(ctx.channel)
             return
 
         await self.db.set_user_timezone(candidate)
-        await ctx.send(f"Timezone set to `{candidate}`.")
+        await send_discord_text(ctx.channel, f"Timezone set to `{candidate}`.")
         await self._maybe_send_settings_tip(ctx.channel)
 
     @commands.Cog.listener()
@@ -192,25 +273,7 @@ class ActivityCog(commands.Cog):
         if not content or content.startswith(self.settings.command_prefix):
             return
 
-        classification = await self._classify_activity(content)
-        classification = self._normalize_activity_classification(content, classification)
-        today_local = await self._local_today()
-        await self.db.add_activity(
-            activity_date=today_local,
-            activity_type=classification["activity_type"],
-            description=content,
-            intensity=classification["intensity"],
-            muscle_groups=classification["muscle_groups"],
-        )
-        recovery_note = await self._estimate_recovery_message(
-            classification["muscle_groups"],
-            classification["intensity"],
-        )
-        await message.channel.send(
-            f"Logged on {today_local.isoformat()}: {classification['activity_type']} ({classification['intensity']}) "
-            f"for {classification['muscle_groups'] or 'general recovery context'}.\n"
-            f"{recovery_note}"
-        )
+        await self._handle_activity_text(message.channel, content)
 
 
 async def setup(bot: commands.Bot) -> None:

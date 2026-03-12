@@ -147,6 +147,33 @@ class ProgrammeCog(commands.Cog):
     def _clear_pending_program(self, user_id: int, channel_id: int) -> None:
         self.pending_programs.pop(self._pending_key(user_id, channel_id), None)
 
+    def _extract_exercise_summary(self, raw_text: str) -> list[dict[str, Any]]:
+        blocks = self.parser._extract_day_blocks(raw_text)
+        summary: list[dict[str, Any]] = []
+        for block in blocks:
+            day_name = str(block.get("name") or "Day")
+            for ex in block.get("exercises", []):
+                name = str(ex.get("name") or "").strip()
+                if not name:
+                    continue
+                summary.append(
+                    {
+                        "day": day_name,
+                        "name": name,
+                        "sets": ex.get("sets"),
+                        "rep_range_low": ex.get("rep_range_low"),
+                        "rep_range_high": ex.get("rep_range_high"),
+                        "notes": ex.get("notes") or "",
+                        "category": self.parser._category_lookup(name),
+                    }
+                )
+        return summary
+
+    def _clear_programme_flow_state(self, user_id: int, channel_id: int) -> None:
+        self._clear_pending_program(user_id, channel_id)
+        self._clear_post_import_context(user_id)
+        self.memory.clear(user_id=user_id, channel_id=channel_id)
+
     def _is_confirm_message(self, text: str) -> bool:
         normalized = " ".join(text.strip().lower().split())
         return normalized in PENDING_CONFIRM_TOKENS or normalized.startswith("save")
@@ -282,8 +309,10 @@ class ProgrammeCog(commands.Cog):
 
     async def _suggest_pending_changes(self, state: PendingProgram) -> str:
         history = self.memory.get(user_id=state.user_id, channel_id=state.channel_id)
+        exercise_summary = self._extract_exercise_summary(state.raw_text)
         payload = {
             "program_text": state.raw_text,
+            "exercise_summary": exercise_summary,
             "user_constraints": state.notes,
             "history": history,
             "task": "Review this program and propose practical swaps/edits based on constraints.",
@@ -293,7 +322,9 @@ class ProgrammeCog(commands.Cog):
             system=(
                 f"{FITNESS_ONLY_GUARDRAIL}\n"
                 "You are reviewing a workout program before import. "
-                "Focus on feasibility with equipment constraints and training goals."
+                "Focus on feasibility with equipment constraints and training goals. "
+                "If discussing Smith Machine swaps: only suggest Smith alternatives for heavy_barbell/light_barbell exercises. "
+                "Never relabel dumbbell/cable/machine/bodyweight lifts as Smith Machine."
             ),
             user=json.dumps(payload, ensure_ascii=False),
             temperature=0.2,
@@ -305,8 +336,10 @@ class ProgrammeCog(commands.Cog):
         if not state.notes:
             return state.raw_text
 
+        exercise_summary = self._extract_exercise_summary(state.raw_text)
         payload = {
             "program_text": state.raw_text,
+            "exercise_summary": exercise_summary,
             "requested_changes": state.notes,
             "instructions": "Return only the finalized program text with day headers and exercise lines. No commentary.",
         }
@@ -314,13 +347,56 @@ class ProgrammeCog(commands.Cog):
             system=(
                 f"{FITNESS_ONLY_GUARDRAIL}\n"
                 "Rewrite the workout program text by applying the requested changes. "
-                "Preserve clear day/exercise structure and sets x reps."
+                "Preserve clear day/exercise structure and sets x reps. "
+                "Only apply Smith Machine renames to heavy_barbell/light_barbell categories."
             ),
             user=json.dumps(payload, ensure_ascii=False),
             temperature=0.15,
             max_tokens=900,
         )
-        return rewritten.strip() or state.raw_text
+        final_text = rewritten.strip() or state.raw_text
+        combined_notes = " ".join(state.notes).lower()
+        if "smith" in combined_notes:
+            final_text = self._enforce_smith_machine_consistency(final_text, exercise_summary)
+        return final_text
+
+    def _enforce_smith_machine_consistency(
+        self,
+        program_text: str,
+        summary: list[dict[str, Any]],
+    ) -> str:
+        lines = program_text.splitlines()
+        heavy_or_light: dict[str, str] = {}
+        not_smith: dict[str, str] = {}
+        for ex in summary:
+            original = str(ex.get("name") or "").strip()
+            if not original:
+                continue
+            key = original.lower()
+            if str(ex.get("category") or "") in {"heavy_barbell", "light_barbell"}:
+                heavy_or_light[key] = original
+            else:
+                not_smith[key] = original
+
+        out_lines: list[str] = []
+        for line in lines:
+            updated = line
+            lower_line = updated.lower()
+            for name, original in heavy_or_light.items():
+                if name in lower_line and "smith machine" not in lower_line:
+                    pattern = re.compile(re.escape(name), re.IGNORECASE)
+                    updated = pattern.sub(f"Smith Machine {original}", updated, count=1)
+                    lower_line = updated.lower()
+                    break
+            for name, original in not_smith.items():
+                smith_name = f"smith machine {name}"
+                if smith_name in lower_line:
+                    pattern = re.compile(re.escape(smith_name), re.IGNORECASE)
+                    updated = pattern.sub(original, updated, count=1)
+                    lower_line = updated.lower()
+                    break
+            out_lines.append(updated)
+        return "\n".join(out_lines)
 
     async def _start_pending_program(
         self,
@@ -357,12 +433,24 @@ class ProgrammeCog(commands.Cog):
             final_text = state.raw_text
 
         parsed = await self.parser.parse_program(final_text)
+        parsed = self._recover_missing_exercises_from_original(parsed, state.raw_text)
         parsed["program_name"] = await self._resolve_program_name(
             channel,
             author,
             final_text,
             str(parsed.get("program_name") or ""),
         )
+        recent = await self.db.get_recent_program_by_name(parsed["program_name"], minutes=5)
+        if recent:
+            self._clear_pending_program(state.user_id, state.channel_id)
+            await send_discord_text(
+                channel,
+                f"⚠️ Skipped duplicate import: **{parsed['program_name']}** was already imported recently (ID {recent['id']}).",
+            )
+            self._set_post_import_context(author.id, getattr(channel, "id", 0), int(recent["id"]))
+            await self._start_day_prompt(channel, int(recent["id"]))
+            return
+
         program_id = await self.db.create_program_from_payload(parsed)
 
         days = parsed.get("days", [])
@@ -375,6 +463,51 @@ class ProgrammeCog(commands.Cog):
         )
         self._set_post_import_context(author.id, getattr(channel, "id", 0), program_id)
         await self._start_day_prompt(channel, program_id)
+
+    def _recover_missing_exercises_from_original(
+        self,
+        parsed: dict[str, Any],
+        original_text: str,
+    ) -> dict[str, Any]:
+        original_blocks = self.parser._extract_day_blocks(original_text)
+        if not original_blocks:
+            return parsed
+
+        parsed_days = parsed.get("days", [])
+        if not parsed_days:
+            return parsed
+
+        for day_idx, original_day in enumerate(original_blocks):
+            if day_idx >= len(parsed_days):
+                break
+            parsed_day = parsed_days[day_idx]
+            parsed_ex = parsed_day.get("exercises", [])
+            original_ex = original_day.get("exercises", [])
+            if len(parsed_ex) >= len(original_ex):
+                continue
+            existing_names = {str(ex.get("name") or "").strip().lower() for ex in parsed_ex}
+            for raw_ex in original_ex:
+                name = str(raw_ex.get("name") or "").strip()
+                if not name:
+                    continue
+                if name.lower() in existing_names:
+                    continue
+                parsed_ex.append(
+                    {
+                        "name": name,
+                        "display_order": len(parsed_ex),
+                        "sets": int(raw_ex.get("sets") or 1),
+                        "rep_range_low": raw_ex.get("rep_range_low"),
+                        "rep_range_high": raw_ex.get("rep_range_high"),
+                        "category": self.parser._category_lookup(name),
+                        "superset_group": None,
+                        "muscle_groups": "",
+                        "notes": str(raw_ex.get("notes") or "recovered_from_source"),
+                    }
+                )
+                existing_names.add(name.lower())
+            parsed_day["exercises"] = parsed_ex
+        return parsed
 
     async def _reply_programme_message(
         self,
@@ -429,11 +562,11 @@ class ProgrammeCog(commands.Cog):
     async def show_program_command(self, ctx: commands.Context) -> None:
         program = await self.db.get_active_program()
         if not program:
-            await ctx.send("No active program yet. Paste one in #programme.")
+            await send_discord_text(ctx.channel, "No active program yet. Paste one in #programme.")
             return
         days = await self.db.get_program_days(program["id"])
         if not days:
-            await ctx.send(f"Active program **{program['name']}** has no days.")
+            await send_discord_text(ctx.channel, f"Active program **{program['name']}** has no days.")
             return
 
         lines = [f"Active program: **{program['name']}** ({len(days)} days)"]
@@ -449,6 +582,14 @@ class ProgrammeCog(commands.Cog):
         handled = await self._handle_start_day_message(ctx.channel, f"start on {text}")
         if not handled:
             await send_discord_text(ctx.channel, "Couldn't parse that day selection. Try `!startday Day 3` or `!startday Legs`.")
+            return
+        context = self._get_post_import_context(ctx.author.id, ctx.channel.id)
+        if context:
+            self._clear_programme_flow_state(ctx.author.id, ctx.channel.id)
+            await send_discord_text(
+                ctx.channel,
+                "Program saved and ready. Head to your workout channel and type `ready` to start.",
+            )
 
     @commands.command(name="travel")
     async def travel_program_command(self, ctx: commands.Context, *, text: str) -> None:
@@ -521,7 +662,7 @@ class ProgrammeCog(commands.Cog):
 
         if pending:
             if self._is_cancel_message(content):
-                self._clear_pending_program(user_id, channel_id)
+                self._clear_programme_flow_state(user_id, channel_id)
                 await send_discord_text(message.channel, "Pending program import discarded.")
                 return
             if self._is_confirm_message(content):
@@ -550,7 +691,11 @@ class ProgrammeCog(commands.Cog):
 
         if await self._handle_start_day_message(message.channel, content):
             if context:
-                self._clear_post_import_context(user_id)
+                self._clear_programme_flow_state(user_id, channel_id)
+                await send_discord_text(
+                    message.channel,
+                    "Program saved and ready. Head to your workout channel and type `ready` to start.",
+                )
             return
 
         if await self._handle_simple_edit_request(message.channel, content):

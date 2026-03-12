@@ -80,6 +80,7 @@ ASK_CHANNEL_ID=
 PRS_CHANNEL_ID=
 SETTINGS_CHANNEL_ID=
 CHANGELOG_CHANNEL_ID=
+ADMIN_ROLE_ID=
 WORKOUT_CHANNEL_IDS=111,222,333,444,555,666,777
 ```
 
@@ -98,6 +99,7 @@ python3 bot.py
 - `!startday <day name or day number>`
 - `!travel <description and optional duration>`
 - `!start`, `!done` (workout channels)
+- `!skipday <n|day name>`, `!goto <day name>` (workout channels)
 - `!plates <weight> [lbs|kg]` (global; unit optional)
 - `!e1rm <exercise>` (global; case-insensitive partial match supported)
 - `!volume` (global)
@@ -110,6 +112,7 @@ python3 bot.py
 - `!checkin`, `!summary` (check-in channel)
 - `!ask <question>`
 - `!prs [days]`
+- Admin: `!debug`, `!setday <n>`, `!reset`, `!deleteprogram`
 - `!help`, `!version`
 
 ## Notes

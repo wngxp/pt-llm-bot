@@ -12,6 +12,15 @@ from utils.discord_messages import send_discord_text
 
 
 QUESTION_WORD_RE = re.compile(r"\b(what|why|how|can|should|when|where|which|who)\b", re.IGNORECASE)
+FITNESS_HINT_RE = re.compile(
+    r"\b(workout|training|exercise|lift|gym|muscle|strength|cardio|nutrition|protein|calorie|recovery|sleep|program|bench|squat|deadlift|press|row|pullup|injury|supplement)\b",
+    re.IGNORECASE,
+)
+OFF_TOPIC_REPLY_RE = re.compile(
+    r"\b(cupcake|recipe|ingredients|preheat|bake|teaspoon|tablespoon|once upon|fiction|politics|election|senate|president)\b",
+    re.IGNORECASE,
+)
+CODE_BLOCK_RE = re.compile(r"```|^\s*(def |class |function |import |#include )", re.IGNORECASE | re.MULTILINE)
 
 
 class AskCog(commands.Cog):
@@ -42,9 +51,21 @@ class AskCog(commands.Cog):
             return True
         if self._is_reply_to_bot(message):
             return True
-        if "?" in content:
+        if "?" in content and FITNESS_HINT_RE.search(content):
             return True
-        return bool(QUESTION_WORD_RE.search(content))
+        if QUESTION_WORD_RE.search(content) and FITNESS_HINT_RE.search(content):
+            return True
+        return False
+
+    def _sanitize_reply(self, question: str, reply: str) -> str:
+        question_lower = question.lower()
+        if OFF_TOPIC_REPLY_RE.search(question_lower) and not FITNESS_HINT_RE.search(question_lower):
+            return "I can only help with fitness and training questions."
+        if OFF_TOPIC_REPLY_RE.search(reply):
+            return "I can only help with fitness and training questions."
+        if CODE_BLOCK_RE.search(reply) and not FITNESS_HINT_RE.search(question_lower):
+            return "I can only help with fitness and training questions."
+        return reply.strip()
 
     async def _answer(self, question: str, *, user_id: int, channel_id: int) -> str:
         context = await self.db.build_context(target_date=self.bot.today())
@@ -70,6 +91,7 @@ class AskCog(commands.Cog):
     async def ask_command(self, ctx: commands.Context, *, question: str) -> None:
         self.memory.append(user_id=ctx.author.id, channel_id=ctx.channel.id, role="user", content=question)
         reply = await self._answer(question, user_id=ctx.author.id, channel_id=ctx.channel.id)
+        reply = self._sanitize_reply(question, reply)
         self.memory.append(user_id=ctx.author.id, channel_id=ctx.channel.id, role="assistant", content=reply)
         await send_discord_text(ctx.channel, reply)
 
@@ -89,6 +111,7 @@ class AskCog(commands.Cog):
         try:
             self.memory.append(user_id=message.author.id, channel_id=message.channel.id, role="user", content=content)
             reply = await self._answer(content, user_id=message.author.id, channel_id=message.channel.id)
+            reply = self._sanitize_reply(content, reply)
             self.memory.append(
                 user_id=message.author.id,
                 channel_id=message.channel.id,
@@ -97,7 +120,7 @@ class AskCog(commands.Cog):
             )
             await send_discord_text(message.channel, reply)
         except Exception as exc:
-            await message.channel.send(f"Couldn't reach coaching model: {exc}")
+            await send_discord_text(message.channel, f"Couldn't reach coaching model: {exc}")
 
 
 async def setup(bot: commands.Bot) -> None:

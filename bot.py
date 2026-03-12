@@ -42,6 +42,8 @@ class PTBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.db.init()
+        # Ensure our custom help command can be registered by cogs.
+        self.remove_command("help")
         for ext in [
             "cogs.programme",
             "cogs.workout",
@@ -120,7 +122,7 @@ class PTBot(commands.Bot):
             logging.warning("Changelog channel not found; skipping startup changelog post.")
             return
 
-        await send_discord_text(channel, f"PT-LLM Bot startup update\\n\\n{section}")
+        await send_discord_text(channel, f"PT-LLM Bot startup update\n\n{section}")
         self._write_last_posted_version(version)
 
 

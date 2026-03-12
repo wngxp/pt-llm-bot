@@ -43,5 +43,12 @@ async def send_discord_text(channel: object, text: str) -> None:
         await sender(chunk)
 
 
+async def send_discord_file(channel: object, *, file: object) -> None:
+    sender = getattr(channel, "send", None)
+    if sender is None:
+        return
+    await sender(file=file)
+
+
 async def send_lines(channel: object, lines: Iterable[str]) -> None:
     await send_discord_text(channel, "\n".join(str(line) for line in lines if line is not None))

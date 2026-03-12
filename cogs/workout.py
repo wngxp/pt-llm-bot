@@ -14,7 +14,7 @@ from discord.ext import commands
 
 from llm.prompts import ASK_SYSTEM_PROMPT
 from utils.e1rm import epley_1rm
-from utils.discord_messages import send_discord_text
+from utils.discord_messages import send_discord_file, send_discord_text
 from utils.export import write_logs_csv
 from utils.formatters import format_exercise_brief, format_set_log
 from utils.input_parser import parse_cue, parse_extend_rest, parse_set_input
@@ -134,6 +134,7 @@ class WorkoutSession:
     rest_task: Optional[asyncio.Task] = None
     rest_seconds: int = 0
     day_activity_warning: Optional[str] = None
+    day_injury_warning: Optional[str] = None
 
     def current_exercise(self) -> Optional[dict[str, Any]]:
         if self.superset:
@@ -205,7 +206,7 @@ class WorkoutCog(commands.Cog):
     async def _maybe_send_settings_tip(self, channel: discord.abc.Messageable) -> None:
         ref = self._settings_channel_ref(channel)
         if ref:
-            await channel.send(f"Tip: use {ref} for utility commands like this.")
+            await send_discord_text(channel, f"Tip: use {ref} for utility commands like this.")
 
     async def _check_weekday_start_channel(self, channel: discord.abc.Messageable) -> bool:
         channel_name = str(getattr(channel, "name", "")).lower()
@@ -220,7 +221,7 @@ class WorkoutCog(commands.Cog):
 
         expected_ref = self._channel_ref_for_name(channel, expected_channel)
         weekday_label = WEEKDAY_LABELS[weekday_idx]
-        await channel.send(f"It's {weekday_label} - head over to {expected_ref} to start your session.")
+        await send_discord_text(channel, f"It's {weekday_label} - head over to {expected_ref} to start your session.")
         return False
 
     def _session_progress(self, session: WorkoutSession) -> tuple[int, int, float]:
@@ -501,6 +502,9 @@ class WorkoutCog(commands.Cog):
         session.day_activity_warning = await self._day_activity_warning(exercises)
         if session.day_activity_warning:
             await send_discord_text(channel, session.day_activity_warning)
+        session.day_injury_warning = await self._day_injury_warning(exercises)
+        if session.day_injury_warning:
+            await send_discord_text(channel, session.day_injury_warning)
 
         state = await self.db.get_user_state()
         last_workout = state.get("last_workout_date")
@@ -537,6 +541,7 @@ class WorkoutCog(commands.Cog):
 
         logs = await self.db.get_last_logs_for_exercise(int(exercise["id"]), limit=3)
         activity_multiplier, activity_note = await self._activity_adjustment_for_exercise(exercise)
+        injury_note = await self._injury_warning_for_exercise(exercise)
         state = await self.db.get_user_state()
         readiness = int(state.get("readiness") or 7)
         readiness_multiplier = 1.0
@@ -595,6 +600,8 @@ class WorkoutCog(commands.Cog):
 
         if activity_note:
             lines.append(activity_note)
+        if injury_note:
+            lines.append(injury_note)
         if readiness_note:
             lines.append(readiness_note)
         lines.append(format_exercise_brief(exercise))
@@ -653,14 +660,14 @@ class WorkoutCog(commands.Cog):
             session.rest_task.cancel()
 
         session.rest_seconds = seconds
-        await channel.send(f"⏱️ Rest {seconds // 60}:{seconds % 60:02d}.")
+        await send_discord_text(channel, f"⏱️ Rest {seconds // 60}:{seconds % 60:02d}.")
 
         async def _timer() -> None:
             try:
                 await asyncio.sleep(seconds)
                 if self.sessions.get(session.channel_id) is not session:
                     return
-                await channel.send(f"Ready. {ready_message}")
+                await send_discord_text(channel, f"Ready. {ready_message}")
                 if prompt_on_ready:
                     await self._prompt_current_exercise(channel, session)
             except asyncio.CancelledError:
@@ -869,6 +876,32 @@ class WorkoutCog(commands.Cog):
             return f"Recovery note: recent moderate activity overlaps with today's muscles ({detail})."
         return None
 
+    async def _day_injury_warning(self, exercises: list[dict[str, Any]]) -> Optional[str]:
+        injuries = await self.db.get_active_injuries()
+        if not injuries:
+            return None
+        day_groups: set[str] = set()
+        for ex in exercises:
+            groups = self._split_groups(str(ex.get("muscle_groups") or ""))
+            if not groups:
+                groups = self._infer_groups_from_exercise_name(str(ex.get("name") or ""))
+            day_groups.update(groups)
+        if not day_groups:
+            return None
+
+        for injury in injuries:
+            injury_groups = self._split_groups(str(injury.get("muscle_groups") or ""))
+            if not injury_groups:
+                continue
+            if day_groups.isdisjoint(injury_groups):
+                continue
+            desc = str(injury.get("description") or "recent injury report")
+            return (
+                f"🚫 Injury flag: {desc}. Exercises hitting {', '.join(sorted(injury_groups))} "
+                "should be skipped or substituted today."
+            )
+        return None
+
     async def _activity_adjustment_for_exercise(self, exercise: dict[str, Any]) -> tuple[float, Optional[str]]:
         exercise_groups = self._split_groups(str(exercise.get("muscle_groups") or ""))
         if not exercise_groups:
@@ -915,6 +948,28 @@ class WorkoutCog(commands.Cog):
                 f"Recovery note: recent moderate activity overlaps with today's muscles ({detail}). Keep effort honest.",
             )
         return 1.0, None
+
+    async def _injury_warning_for_exercise(self, exercise: dict[str, Any]) -> Optional[str]:
+        injuries = await self.db.get_active_injuries()
+        if not injuries:
+            return None
+        ex_groups = self._split_groups(str(exercise.get("muscle_groups") or ""))
+        if not ex_groups:
+            ex_groups = self._infer_groups_from_exercise_name(str(exercise.get("name") or ""))
+        if not ex_groups:
+            return None
+        for injury in injuries:
+            injury_groups = self._split_groups(str(injury.get("muscle_groups") or ""))
+            if not injury_groups:
+                continue
+            if ex_groups.isdisjoint(injury_groups):
+                continue
+            desc = str(injury.get("description") or "active injury")
+            return (
+                f"🚫 Injury flag overlaps this exercise ({', '.join(sorted(injury_groups))}): {desc}. "
+                "Skip or substitute this movement."
+            )
+        return None
 
     def _contains_fatigue_cue(self, text: str) -> bool:
         lowered = text.strip().lower()
@@ -1282,6 +1337,50 @@ class WorkoutCog(commands.Cog):
             return reply.strip()
         return " ".join(sentence_chunks[:3]).strip()
 
+    async def _resolve_day_target_index(self, target: str) -> tuple[Optional[int], list[dict[str, Any]]]:
+        active = await self.db.get_active_program()
+        if not active:
+            return None, []
+        days = await self.db.get_program_days(int(active["id"]))
+        if not days:
+            return None, []
+
+        cleaned = self._normalize_user_text(target)
+        num_match = re.search(r"\b(\d+)\b", cleaned)
+        if num_match:
+            idx = int(num_match.group(1)) - 1
+            if 0 <= idx < len(days):
+                return idx, days
+
+        for day in days:
+            name = self._normalize_user_text(str(day.get("name") or ""))
+            if name and name in cleaned:
+                return int(day["day_order"]), days
+        return None, days
+
+    async def _skip_to_day(self, channel: discord.abc.Messageable, target: str) -> None:
+        idx, days = await self._resolve_day_target_index(target)
+        if idx is None or not days:
+            if days:
+                choices = ", ".join(f"{d['day_order'] + 1}:{d['name']}" for d in days)
+                await send_discord_text(channel, f"Couldn't find that day. Options: {choices}")
+            else:
+                await send_discord_text(channel, "No active program days available.")
+            return
+
+        active_session = self.sessions.get(getattr(channel, "id", 0))
+        if active_session:
+            await self._cancel_rest(active_session)
+            self.sessions.pop(active_session.channel_id, None)
+            self._clear_early_end_prompts_for_channel(active_session.channel_id)
+            await send_discord_text(channel, "Ended current session and applied day skip.")
+
+        await self.db.set_current_day_index(idx)
+        await send_discord_text(
+            channel,
+            f"Skipped to Day {idx + 1} - {days[idx]['name']}. Type `ready` to start.",
+        )
+
     @commands.command(name="start")
     async def start_workout_command(self, ctx: commands.Context) -> None:
         if not self._is_workout_channel(ctx.channel):
@@ -1310,6 +1409,18 @@ class WorkoutCog(commands.Cog):
         session.current_index = len(session.exercises)
         session.superset = None
         await self._complete_session(ctx.channel, session)
+
+    @commands.command(name="skipday")
+    async def skipday_command(self, ctx: commands.Context, *, target: str) -> None:
+        if not self._is_workout_channel(ctx.channel):
+            return
+        await self._skip_to_day(ctx.channel, target)
+
+    @commands.command(name="goto")
+    async def goto_command(self, ctx: commands.Context, *, day_name_or_number: str) -> None:
+        if not self._is_workout_channel(ctx.channel):
+            return
+        await self._skip_to_day(ctx.channel, day_name_or_number)
 
     @commands.command(name="plates")
     async def plates_command(self, ctx: commands.Context, weight: float, unit: str = "") -> None:
@@ -1366,7 +1477,7 @@ class WorkoutCog(commands.Cog):
 
         stem = f"{exercise_name.strip().lower().replace(' ', '_')}_logs" if exercise_name.strip() else "workout_logs"
         csv_path = write_logs_csv(rows, stem=stem)
-        await ctx.send(file=discord.File(str(csv_path)))
+        await send_discord_file(ctx.channel, file=discord.File(str(csv_path)))
         await self._maybe_send_settings_tip(ctx.channel)
 
     @commands.Cog.listener()
