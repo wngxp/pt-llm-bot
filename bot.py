@@ -25,7 +25,11 @@ class PTBot(commands.Bot):
         intents.guilds = True
         intents.messages = True
 
-        super().__init__(command_prefix=settings.command_prefix, intents=intents)
+        super().__init__(
+            command_prefix=settings.command_prefix,
+            intents=intents,
+            help_command=None,
+        )
         self.settings = settings
         self.db = Database(settings.database_path)
         self.ollama = OllamaClient(settings.ollama_base_url, settings.ollama_model)
@@ -39,6 +43,7 @@ class PTBot(commands.Bot):
             "cogs.checkin",
             "cogs.ask",
             "cogs.prs",
+            "cogs.utility",
         ]:
             await self.load_extension(ext)
         logging.info("Loaded all cogs")

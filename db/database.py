@@ -117,6 +117,18 @@ class Database:
     async def set_current_day_index(self, day_index: int) -> None:
         await self.update_user_state(current_day_index=max(0, day_index))
 
+    async def set_current_day_for_active_program(self, day_order: int) -> bool:
+        program = await self.get_active_program()
+        if not program:
+            return False
+        days = await self.get_program_days(int(program["id"]))
+        if not days:
+            return False
+        if day_order < 0 or day_order >= len(days):
+            return False
+        await self.set_current_day_index(day_order)
+        return True
+
     async def get_active_program(self) -> Optional[dict[str, Any]]:
         await self._revert_expired_temporary_program_if_needed()
         async with self.connect() as conn:
@@ -623,6 +635,51 @@ class Database:
                 (program["id"], name),
             )
         return dict(row) if row else None
+
+    async def update_exercise_name_in_active_program(self, old_name: str, new_name: str) -> int:
+        program = await self.get_active_program()
+        if not program:
+            return 0
+        async with self.connect() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE exercises
+                SET name = ?
+                WHERE id = (
+                    SELECT e.id
+                    FROM exercises e
+                    JOIN program_days d ON d.id = e.program_day_id
+                    WHERE d.program_id = ? AND LOWER(e.name) = LOWER(?)
+                    ORDER BY d.day_order, e.display_order
+                    LIMIT 1
+                )
+                """,
+                (new_name, int(program["id"]), old_name),
+            )
+            await conn.commit()
+            return int(cursor.rowcount or 0)
+
+    async def rename_program_day_in_active_program(self, old_name: str, new_name: str) -> int:
+        program = await self.get_active_program()
+        if not program:
+            return 0
+        async with self.connect() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE program_days
+                SET name = ?
+                WHERE id = (
+                    SELECT id
+                    FROM program_days
+                    WHERE program_id = ? AND LOWER(name) = LOWER(?)
+                    ORDER BY day_order
+                    LIMIT 1
+                )
+                """,
+                (new_name, int(program["id"]), old_name),
+            )
+            await conn.commit()
+            return int(cursor.rowcount or 0)
 
     async def get_latest_workout_date(self) -> Optional[date]:
         async with self.connect() as conn:

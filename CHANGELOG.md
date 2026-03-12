@@ -23,3 +23,20 @@
 ### Added
 - `user_state.timezone` support with migration-safe initialization
 - `!timezone` command to view/set timezone (IANA format)
+
+## [0.2.2] - 2026-03-12
+### Fixed
+- Strict set-count enforcement now prevents extra sets beyond programmed amount and advances correctly
+- Exercise transitions now require full exercise presentation before accepting set logs
+- Set parsing now accepts trailing text (for example: `225 x 4 im tired`) and logs fatigue cues
+- Workout message priority now parses sets before LLM routing to avoid unsolicited long coaching replies
+- PR announcements in workout flow are now short inline messages and only announced for compound/bodyweight categories
+- Parser now preserves distinct exercise variants (for example `Pause Squat`) and repairs duplicate-name collisions
+- `#programme` now responds to post-import follow-ups including start-day selection and basic edit intents
+- `#activity` now reports log date and recovery impact guidance for upcoming sessions
+- `#check-in` now responds to conversational readiness signals and adjusts readiness
+
+### Added
+- Post-import `#programme` context window (~5 minutes) for follow-up commands like `start on Legs`
+- Dedicated utility command support with `SETTINGS_CHANNEL_ID` and tips when commands are run outside `#settings`
+- `!help`, `!version`, and `!startday` commands

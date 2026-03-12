@@ -53,6 +53,9 @@ Rules:
   - Squat / Bench Press / Deadlift / OHP / Barbell Row -> heavy_barbell
   - Lat Pulldown / Leg Press / Machine Row / Cable Fly -> cable_machine
   - Pull-Up / Chin-Up / Push-Up / Dip -> bodyweight
+- NEVER merge or rename exercise variations.
+- "Pause Squat", "Close-Grip Bench", and "Larsen Press" are distinct from "Squat" and "Bench Press".
+- Preserve the exact exercise name text from input.
 - Return ONLY valid JSON, no markdown backticks or preamble
 """.strip()
 

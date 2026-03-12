@@ -8,10 +8,8 @@ PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-SET_PATTERN = re.compile(
+SET_SEARCH_PATTERN = re.compile(
     r"""
-    ^
-    (?:(?P<exercise>[a-zA-Z][a-zA-Z0-9 _\-']*?)\s+)?
     (?P<weight_token>
         bodyweight(?:\s*[+-]\s*\d+(?:\.\d+)?)?
         |
@@ -22,19 +20,17 @@ SET_PATTERN = re.compile(
     \s*(?P<unit>kg|kgs|lb|lbs)?
     \s*(?:x|×|for)\s*
     (?P<reps>\d+)
-    $
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
-RIR_TRAILING_PATTERN = re.compile(
+RIR_ANY_PATTERN = re.compile(
     r"""
     (?:
         @\s*(?P<at_rir>\d+)\s*(?:rir)?
         |
         \brir\s*[:=]?\s*(?P<label_rir>\d+)
     )
-    \s*$
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -43,6 +39,24 @@ BW_TOKEN_PATTERN = re.compile(
     r"^(?P<base>bw|bodyweight)(?:(?P<op>[+-])(?P<offset>\d+(?:\.\d+)?))?$",
     re.IGNORECASE,
 )
+
+EXERCISE_NOISE_WORDS = {
+    "i",
+    "im",
+    "i'm",
+    "got",
+    "bro",
+    "dude",
+    "today",
+    "yesterday",
+    "just",
+    "did",
+    "felt",
+    "feeling",
+    "and",
+    "but",
+    "then",
+}
 
 CUE_PATTERN = re.compile(r"(?:remind me to|cue:?|remember to)\s+(.+)$", re.IGNORECASE)
 EXTEND_REST_PATTERN = re.compile(r"^extend\s+(?P<minutes>\d+)\s*(?:m|min|minute|minutes)$", re.IGNORECASE)
@@ -62,17 +76,7 @@ def _normalize_text(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\bbody\s+weight\b", "bodyweight", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bbw\s*([+-])\s*(\d+(?:\.\d+)?)\b", r"bw\1\2", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.rstrip(".,!?")
-    return cleaned.strip()
-
-
-def _extract_rir(text: str) -> tuple[str, Optional[int]]:
-    match = RIR_TRAILING_PATTERN.search(text)
-    if not match:
-        return text, None
-    rir_raw = match.group("at_rir") or match.group("label_rir")
-    stripped = text[: match.start()].strip()
-    return stripped, int(rir_raw)
+    return cleaned.strip().rstrip(".,!?")
 
 
 def _parse_weight_token(token: str) -> tuple[float, bool, str]:
@@ -92,18 +96,56 @@ def _parse_weight_token(token: str) -> tuple[float, bool, str]:
     return 0.0, True, f"bw{sign}{clean_offset}"
 
 
+def _extract_exercise_candidate(prefix_text: str) -> tuple[Optional[str], str]:
+    candidate = prefix_text.strip(" -,:;")
+    if not candidate:
+        return None, ""
+
+    candidate = PREFIX_PATTERN.sub("", candidate).strip()
+    if not candidate:
+        return None, ""
+
+    words = candidate.split()
+    if len(words) > 6:
+        return None, candidate
+
+    if any(any(ch.isdigit() for ch in word) for word in words):
+        return None, candidate
+
+    if len(words) == 1 and words[0].lower() in EXERCISE_NOISE_WORDS:
+        return None, candidate
+    if any(word.lower() in EXERCISE_NOISE_WORDS for word in words):
+        return None, candidate
+
+    return candidate, ""
+
+
 def parse_set_input(text: str) -> Optional[dict[str, Any]]:
     cleaned = _normalize_text(text)
-    cleaned, extracted_rir = _extract_rir(cleaned)
-
-    match = SET_PATTERN.match(cleaned)
+    match = SET_SEARCH_PATTERN.search(cleaned)
     if not match:
         return None
 
-    exercise = (match.group("exercise") or "").strip()
+    before = cleaned[: match.start()].strip()
+    after = cleaned[match.end() :].strip()
+
+    exercise, leftover_prefix = _extract_exercise_candidate(before)
+
     weight, is_bodyweight, bw_note = _parse_weight_token(match.group("weight_token"))
     reps = int(match.group("reps"))
     unit_raw = match.group("unit")
+
+    tail_parts = [part for part in [leftover_prefix, after] if part]
+    trailing_text = " ".join(tail_parts).strip()
+
+    rir = None
+    if trailing_text:
+        rir_match = RIR_ANY_PATTERN.search(trailing_text)
+        if rir_match:
+            rir_raw = rir_match.group("at_rir") or rir_match.group("label_rir")
+            rir = int(rir_raw)
+            trailing_text = RIR_ANY_PATTERN.sub(" ", trailing_text)
+            trailing_text = re.sub(r"\s+", " ", trailing_text).strip(" -,:;")
 
     note = bw_note if is_bodyweight else ""
     return {
@@ -112,9 +154,10 @@ def parse_set_input(text: str) -> Optional[dict[str, Any]]:
         "reps": reps,
         "unit": normalize_unit(unit_raw) if unit_raw else None,
         "unit_explicit": bool(unit_raw),
-        "rir": extracted_rir,
+        "rir": rir,
         "is_bodyweight": is_bodyweight,
         "note": note,
+        "trailing_text": trailing_text,
     }
 
 

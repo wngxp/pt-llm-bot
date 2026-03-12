@@ -78,10 +78,11 @@ ACTIVITY_CHANNEL_ID=
 CHECKIN_CHANNEL_ID=
 ASK_CHANNEL_ID=
 PRS_CHANNEL_ID=
+SETTINGS_CHANNEL_ID=
 WORKOUT_CHANNEL_IDS=111,222,333,444,555,666,777
 ```
 
-If channel IDs are not set, the bot falls back to channel names (`programme`, `activity`, `check-in`, `ask`, `prs`, and weekday names `mon..sun`).
+If channel IDs are not set, the bot falls back to channel names (`programme`, `activity`, `check-in`, `ask`, `prs`, `settings`, and weekday names `mon..sun`).
 
 5. Run:
 
@@ -93,6 +94,7 @@ python3 bot.py
 
 - `!import <program text>` (in `#programme`)
 - `!program`
+- `!startday <day name or day number>`
 - `!travel <description and optional duration>`
 - `!start`, `!done` (workout channels)
 - `!plates <weight> [lbs|kg]`
@@ -107,6 +109,7 @@ python3 bot.py
 - `!checkin`
 - `!ask <question>`
 - `!prs [days]`
+- `!help`, `!version`
 
 ## Notes
 

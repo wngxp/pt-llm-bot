@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -13,7 +14,7 @@ from discord.ext import commands
 from llm.prompts import ASK_SYSTEM_PROMPT
 from utils.e1rm import epley_1rm
 from utils.export import write_logs_csv
-from utils.formatters import format_exercise_brief, format_pr_message, format_set_log
+from utils.formatters import format_exercise_brief, format_set_log
 from utils.input_parser import parse_cue, parse_extend_rest, parse_set_input
 from utils.plates import plates_breakdown
 from utils.progression import suggest_weight
@@ -33,12 +34,17 @@ READY_TOKENS = {"ready", "start", "lets go", "let's go", "go"}
 WEEKDAY_CHANNEL_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 EARLY_END_INTENTS = {
+    "done",
+    "im done",
+    "i'm done",
+    "end",
     "stop",
     "done for today",
     "gotta go",
     "got to go",
     "need to go",
     "have to go",
+    "leaving",
     "end workout",
     "end session",
     "quit",
@@ -47,6 +53,18 @@ YES_TOKENS = {"yes", "y", "yeah", "yep", "sure"}
 NO_TOKENS = {"no", "n", "nah", "nope", "cancel", "continue"}
 RESUME_TOKENS = {"resume", "pause", "later", "resume later"}
 MOVE_ON_TOKENS = {"move on", "moveon", "advance", "next day", "end and move on"}
+FATIGUE_CUE_WORDS = {
+    "tired",
+    "cant do any more",
+    "can't do any more",
+    "cannot do any more",
+    "cant do more",
+    "can't do more",
+    "felt heavy",
+    "too heavy",
+    "exhausted",
+    "drained",
+}
 QUESTION_WORDS = {
     "what",
     "why",
@@ -83,6 +101,7 @@ class WorkoutSession:
     started_at: datetime
     current_index: int = 0
     set_counts: dict[int, int] = field(default_factory=dict)
+    presented_exercises: set[int] = field(default_factory=set)
     exercise_units: dict[int, str] = field(default_factory=dict)
     logged_sets: list[dict[str, Any]] = field(default_factory=list)
     pr_events: list[dict[str, Any]] = field(default_factory=list)
@@ -145,6 +164,24 @@ class WorkoutCog(commands.Cog):
             if expected is not None:
                 return expected.mention
         return f"#{expected_name}"
+
+    def _settings_channel_ref(self, channel: discord.abc.Messageable) -> Optional[str]:
+        settings_id = self.settings.settings_channel_id
+        if not settings_id:
+            return None
+        if getattr(channel, "id", None) == settings_id:
+            return None
+        guild = getattr(channel, "guild", None)
+        if guild and isinstance(guild, discord.Guild):
+            target = guild.get_channel(settings_id)
+            if isinstance(target, discord.TextChannel):
+                return target.mention
+        return "#settings"
+
+    async def _maybe_send_settings_tip(self, channel: discord.abc.Messageable) -> None:
+        ref = self._settings_channel_ref(channel)
+        if ref:
+            await channel.send(f"Tip: use {ref} for utility commands like this.")
 
     async def _check_weekday_start_channel(self, channel: discord.abc.Messageable) -> bool:
         channel_name = str(getattr(channel, "name", "")).lower()
@@ -395,6 +432,8 @@ class WorkoutCog(commands.Cog):
         if logs:
             compact = ", ".join(f"{l['weight']:g}{l['unit']}x{l['reps']}" for l in logs)
             last_lines.append(f"Last: {compact}")
+        else:
+            last_lines.append("Last: no history")
 
         warmup = None
         category = str(exercise.get("category") or "cable_machine")
@@ -427,6 +466,7 @@ class WorkoutCog(commands.Cog):
             lines.append(f"💡 Cue: {cue}")
 
         next_set = session.set_counts[int(exercise["id"])] + 1
+        session.presented_exercises.add(int(exercise["id"]))
         lines.append(f"Log set {next_set}/{exercise['sets']} as `weight x reps` (optionally `@rir`).")
         await channel.send("\n".join(lines))
 
@@ -605,18 +645,41 @@ class WorkoutCog(commands.Cog):
         )
         return None
 
-    async def _check_and_record_pr(
+    def _contains_fatigue_cue(self, text: str) -> bool:
+        lowered = text.strip().lower()
+        if not lowered:
+            return False
+        return any(cue in lowered for cue in FATIGUE_CUE_WORDS)
+
+    async def _apply_fatigue_adjustment_if_needed(
         self,
         channel: discord.abc.Messageable,
+        trailing_text: str,
+    ) -> None:
+        if not self._contains_fatigue_cue(trailing_text):
+            return
+        state = await self.db.get_user_state()
+        readiness = int(state.get("readiness") or 7)
+        next_readiness = max(1, readiness - 1)
+        if next_readiness == readiness:
+            return
+        await self.db.update_user_state(readiness=next_readiness)
+        await channel.send(
+            f"Noted fatigue cue. Readiness adjusted to {next_readiness}/10 for upcoming suggestions."
+        )
+
+    async def _check_and_record_pr(
+        self,
         session: WorkoutSession,
         exercise_name: str,
         weight: float,
         reps: int,
         unit: str,
         workout_log_id: int,
-    ) -> Optional[dict[str, Any]]:
+        category: str,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         if weight <= 0:
-            return None
+            return None, None
 
         key = exercise_name.strip().lower()
         e1rm = epley_1rm(weight, reps)
@@ -633,7 +696,7 @@ class WorkoutCog(commands.Cog):
                 workout_log_id=workout_log_id,
             )
             session.baseline_exercises.add(key)
-            return None
+            return None, None
 
         pr_type: Optional[str] = None
         if e1rm > float(existing["estimated_1rm"]):
@@ -644,7 +707,7 @@ class WorkoutCog(commands.Cog):
             pr_type = "reps"
 
         if not pr_type:
-            return None
+            return None, None
 
         await self.db.create_pr(
             exercise_name,
@@ -657,10 +720,11 @@ class WorkoutCog(commands.Cog):
         )
 
         if key in session.baseline_exercises:
-            return None
+            return None, None
 
-        msg = format_pr_message(exercise_name, weight, reps, unit, e1rm, existing)
-        await channel.send(msg)
+        announce_categories = {"heavy_barbell", "light_barbell", "bodyweight"}
+        if category not in announce_categories:
+            return None, None
 
         payload = {
             "exercise_name": exercise_name,
@@ -671,7 +735,8 @@ class WorkoutCog(commands.Cog):
             "previous": existing,
         }
         self.bot.dispatch("pr_hit", payload)
-        return payload
+        short_message = f"🏆 PR! {weight:g}{unit} x {reps} (e1RM: {e1rm:.1f})"
+        return payload, short_message
 
     async def _handle_logged_set(
         self,
@@ -688,7 +753,24 @@ class WorkoutCog(commands.Cog):
         done_sets = session.set_counts.get(ex_id, 0)
         total_sets = int(target["sets"])
         if done_sets >= total_sets:
+            if session.superset:
+                await self._advance_superset(channel, session)
+                return
+
+            current = session.current_exercise()
+            if current and int(current["id"]) == ex_id:
+                await channel.send(f"{target['name']} is complete. Moving to the next exercise.")
+                session.current_index += 1
+                if session.current_index >= len(session.exercises):
+                    await self._complete_session(channel, session)
+                else:
+                    await self._prompt_current_exercise(channel, session)
+                return
             await channel.send(f"{target['name']} is already complete for today.")
+            return
+
+        if ex_id not in session.presented_exercises:
+            await self._prompt_current_exercise(channel, session)
             return
 
         unit = await self._resolve_unit(channel, session, ex_id, parsed)
@@ -696,7 +778,10 @@ class WorkoutCog(commands.Cog):
             return
 
         set_number = done_sets + 1
-        note = str(parsed.get("note") or "")
+        parsed_note = str(parsed.get("note") or "").strip()
+        trailing_text = str(parsed.get("trailing_text") or "").strip()
+        note_parts = [part for part in [parsed_note, trailing_text] if part]
+        note = "; ".join(note_parts)
 
         log_id = await self.db.log_set(
             exercise_id=ex_id,
@@ -710,21 +795,35 @@ class WorkoutCog(commands.Cog):
         )
         session.set_counts[ex_id] = set_number
 
+        category = str(target.get("category") or "cable_machine")
+        pr_payload, short_pr = await self._check_and_record_pr(
+            session,
+            str(target["name"]),
+            float(parsed["weight"]),
+            int(parsed["reps"]),
+            str(unit),
+            log_id,
+            category,
+        )
+        if pr_payload:
+            session.pr_events.append(pr_payload)
+
         if parsed.get("is_bodyweight"):
             display_load = note or "bodyweight"
-            await channel.send(
-                f"✅ Set {set_number}: {target['name']} — {display_load} x {int(parsed['reps'])}"
-            )
+            set_message = f"✅ Set {set_number}: {target['name']} — {display_load} x {int(parsed['reps'])}"
         else:
-            await channel.send(
-                format_set_log(
-                    exercise_name=str(target["name"]),
-                    weight=float(parsed["weight"]),
-                    reps=int(parsed["reps"]),
-                    unit=str(unit),
-                    set_number=set_number,
-                )
+            set_message = format_set_log(
+                exercise_name=str(target["name"]),
+                weight=float(parsed["weight"]),
+                reps=int(parsed["reps"]),
+                unit=str(unit),
+                set_number=set_number,
             )
+        if short_pr:
+            set_message = f"{set_message} | {short_pr}"
+        await channel.send(set_message)
+
+        await self._apply_fatigue_adjustment_if_needed(channel, trailing_text)
 
         cue = parse_cue(parsed.get("raw", ""))
         if cue:
@@ -744,23 +843,10 @@ class WorkoutCog(commands.Cog):
             }
         )
 
-        pr_payload = await self._check_and_record_pr(
-            channel,
-            session,
-            str(target["name"]),
-            float(parsed["weight"]),
-            int(parsed["reps"]),
-            str(unit),
-            log_id,
-        )
-        if pr_payload:
-            session.pr_events.append(pr_payload)
-
         if session.superset:
             await self._advance_superset(channel, session)
             return
 
-        category = str(target.get("category") or "cable_machine")
         rest = REST_SECONDS_BY_CATEGORY.get(category, 90)
 
         is_last_set_for_exercise = set_number >= total_sets
@@ -856,6 +942,7 @@ class WorkoutCog(commands.Cog):
         current = session.current_exercise()
         payload = {
             "question": question,
+            "response_style": "Keep the answer to 2-3 short sentences.",
             "context": {
                 "day": session.day.get("name"),
                 "current_exercise": current,
@@ -863,11 +950,15 @@ class WorkoutCog(commands.Cog):
                 "readiness": state.get("readiness"),
             },
         }
-        return await self.bot.ollama.chat(
+        reply = await self.bot.ollama.chat(
             system=ASK_SYSTEM_PROMPT,
             user=json.dumps(payload, ensure_ascii=False),
             temperature=0.25,
         )
+        sentence_chunks = [chunk.strip() for chunk in re.split(r"(?<=[.!?])\\s+", reply) if chunk.strip()]
+        if len(sentence_chunks) <= 3:
+            return reply.strip()
+        return " ".join(sentence_chunks[:3]).strip()
 
     @commands.command(name="start")
     async def start_workout_command(self, ctx: commands.Context) -> None:
@@ -910,6 +1001,7 @@ class WorkoutCog(commands.Cog):
         rows = await self.db.get_e1rm_history(exercise_name, limit=12)
         if not rows:
             await ctx.send(f"No history for {exercise_name}.")
+            await self._maybe_send_settings_tip(ctx.channel)
             return
 
         lines = [f"{exercise_name.title()} estimated 1RM trend:"]
@@ -920,27 +1012,32 @@ class WorkoutCog(commands.Cog):
         delta = rows[-1]["e1rm"] - rows[0]["e1rm"]
         lines.append(f"Trend: {delta:+.1f} over {len(rows)} entries")
         await ctx.send("\n".join(lines))
+        await self._maybe_send_settings_tip(ctx.channel)
 
     @commands.command(name="volume")
     async def volume_command(self, ctx: commands.Context) -> None:
         weekly = await self.db.get_weekly_volume()
         await ctx.send(format_volume_report(weekly))
+        await self._maybe_send_settings_tip(ctx.channel)
 
     @commands.command(name="cue")
     async def cue_command(self, ctx: commands.Context, exercise_name: str, *, cue: str) -> None:
         await self.db.save_cue(exercise_name, cue)
         await ctx.send(f'Saved cue for {exercise_name}: "{cue}"')
+        await self._maybe_send_settings_tip(ctx.channel)
 
     @commands.command(name="export")
     async def export_command(self, ctx: commands.Context, *, exercise_name: str = "") -> None:
         rows = await self.db.export_logs(exercise_name=exercise_name.strip() or None)
         if not rows:
             await ctx.send("No logs to export.")
+            await self._maybe_send_settings_tip(ctx.channel)
             return
 
         stem = f"{exercise_name.strip().lower().replace(' ', '_')}_logs" if exercise_name.strip() else "workout_logs"
         csv_path = write_logs_csv(rows, stem=stem)
         await ctx.send(file=discord.File(str(csv_path)))
+        await self._maybe_send_settings_tip(ctx.channel)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -1027,6 +1124,11 @@ class WorkoutCog(commands.Cog):
 
             parsed = parse_set_input(content)
             if parsed:
+                if session.rest_task and not session.rest_task.done():
+                    await message.channel.send(
+                        "Rest timer is active. Wait for the prompt or type `skip rest`."
+                    )
+                    return
                 parsed["raw"] = content
                 await self._handle_logged_set(message.channel, session, parsed)
                 return

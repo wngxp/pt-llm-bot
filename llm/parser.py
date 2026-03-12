@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import re
 from typing import Any, Optional
 
@@ -50,15 +51,14 @@ class ProgramParser:
     def _post_process_program(self, parsed: dict[str, Any], raw_text: str) -> dict[str, Any]:
         day_blocks = self._extract_day_blocks(raw_text)
         if day_blocks:
-            if len(parsed["days"]) != len(day_blocks):
-                parsed = self._rebuild_from_day_blocks(parsed, day_blocks)
-            else:
-                parsed = self._merge_missing_exercises(parsed, day_blocks)
+            parsed = self._rebuild_from_day_blocks(parsed, day_blocks)
+            parsed = self._repair_duplicate_names_from_raw(parsed, day_blocks)
 
         for day in parsed["days"]:
             for ex in day["exercises"]:
                 self._apply_category_fallback(ex)
                 self._flag_or_repair_rep_ranges(ex, raw_text)
+            self._flag_suspicious_adjacent_duplicates(day)
 
         parsed["days"].sort(key=lambda d: d["day_order"])
         for idx, day in enumerate(parsed["days"]):
@@ -66,6 +66,95 @@ class ProgramParser:
             for ex_idx, ex in enumerate(day["exercises"]):
                 ex["display_order"] = ex_idx
         return parsed
+
+    def _repair_duplicate_names_from_raw(
+        self,
+        parsed: dict[str, Any],
+        blocks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        for day_idx, day in enumerate(parsed["days"]):
+            if day_idx >= len(blocks):
+                break
+            block = blocks[day_idx]
+            parsed_exercises = day.get("exercises", [])
+            raw_exercises = block.get("exercises", [])
+            if not parsed_exercises or not raw_exercises:
+                continue
+
+            raw_norms = [self._normalize_name(ex.get("name", "")) for ex in raw_exercises]
+            parsed_norms = [self._normalize_name(ex.get("name", "")) for ex in parsed_exercises]
+            raw_counter = Counter(raw_norms)
+            parsed_counter = Counter(parsed_norms)
+
+            missing_norms: list[str] = []
+            for norm, count in raw_counter.items():
+                missing = count - parsed_counter.get(norm, 0)
+                if missing > 0:
+                    missing_norms.extend([norm] * missing)
+            if not missing_norms:
+                continue
+
+            extra_indexes: list[int] = []
+            seen_counter: Counter[str] = Counter()
+            for idx, norm in enumerate(parsed_norms):
+                seen_counter[norm] += 1
+                if seen_counter[norm] > raw_counter.get(norm, 0):
+                    extra_indexes.append(idx)
+
+            if not extra_indexes:
+                continue
+
+            used_raw_indexes: set[int] = set()
+            for idx in extra_indexes:
+                if not missing_norms:
+                    break
+                target_norm = missing_norms.pop(0)
+                raw_idx = self._find_raw_index_by_norm(raw_exercises, target_norm, used_raw_indexes)
+                if raw_idx is None:
+                    continue
+                used_raw_indexes.add(raw_idx)
+                raw_ex = raw_exercises[raw_idx]
+                parsed_ex = parsed_exercises[idx]
+
+                parsed_ex["name"] = str(raw_ex.get("name") or parsed_ex.get("name") or "").strip()
+                parsed_ex["sets"] = int(raw_ex.get("sets") or parsed_ex.get("sets") or 1)
+                parsed_ex["rep_range_low"] = raw_ex.get("rep_range_low")
+                parsed_ex["rep_range_high"] = raw_ex.get("rep_range_high")
+                note = str(parsed_ex.get("notes") or "").strip()
+                repair_tag = "parse_repaired_duplicate_name"
+                parsed_ex["notes"] = f"{note}; {repair_tag}".strip("; ")
+                self._apply_category_fallback(parsed_ex)
+
+        return parsed
+
+    def _find_raw_index_by_norm(
+        self,
+        raw_exercises: list[dict[str, Any]],
+        target_norm: str,
+        used: set[int],
+    ) -> Optional[int]:
+        for idx, raw in enumerate(raw_exercises):
+            if idx in used:
+                continue
+            if self._normalize_name(raw.get("name", "")) == target_norm:
+                return idx
+        return None
+
+    def _flag_suspicious_adjacent_duplicates(self, day: dict[str, Any]) -> None:
+        exercises = day.get("exercises", [])
+        for idx in range(1, len(exercises)):
+            prev = exercises[idx - 1]
+            curr = exercises[idx]
+            same_name = self._normalize_name(prev.get("name", "")) == self._normalize_name(curr.get("name", ""))
+            same_sets = int(prev.get("sets", 0) or 0) == int(curr.get("sets", 0) or 0)
+            same_low = prev.get("rep_range_low") == curr.get("rep_range_low")
+            same_high = prev.get("rep_range_high") == curr.get("rep_range_high")
+            if not (same_name and same_sets and same_low and same_high):
+                continue
+            note = str(curr.get("notes") or "").strip()
+            warning = "parse_warning: duplicate adjacent exercise name/scheme"
+            if warning not in note.lower():
+                curr["notes"] = f"{note}; {warning}".strip("; ")
 
     def _normalize_program(self, payload: dict[str, Any]) -> dict[str, Any]:
         program_name = str(payload.get("program_name") or "Imported Program").strip()
@@ -163,11 +252,6 @@ class ProgramParser:
                         display_order=ex_idx,
                     )
                 )
-
-            for llm_idx, llm_ex in enumerate(llm_exercises):
-                if llm_idx in used_llm_indexes:
-                    continue
-                rebuilt_exercises.append(self._compose_exercise(None, llm_ex, display_order=len(rebuilt_exercises)))
 
             rebuilt_days.append(
                 {
