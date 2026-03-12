@@ -34,9 +34,23 @@ class PRsCog(commands.Cog):
         if not channel:
             return
 
+        performer = str(payload.get("performer_name") or "").strip()
+        performer_prefix = f"{performer} " if performer else ""
+
+        if payload.get("is_first_benchmark"):
+            lines = [
+                (
+                    f"📊 {performer_prefix}logged their first {payload['exercise_name']}: "
+                    f"{format_standard_number(float(payload['weight']))} {payload['unit']} x {payload['reps']}"
+                ),
+                f"Starting benchmark e1RM: {format_standard_number(float(payload['e1rm']))}",
+            ]
+            await send_discord_text(channel, "\n".join(lines))
+            return
+
         previous = payload.get("previous")
         lines = [
-            f"🏆 New {payload['exercise_name']} PR!",
+            f"🏆 {performer_prefix}hit a new {payload['exercise_name']} PR!",
             (
                 f"{format_standard_number(float(payload['weight']))} {payload['unit']} x {payload['reps']} "
                 f"(estimated 1RM: {format_standard_number(float(payload['e1rm']))})"

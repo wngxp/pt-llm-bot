@@ -595,6 +595,10 @@ class ProgramParser:
 
     def _category_lookup(self, name: str, fallback: str = "") -> str:
         lower_name = name.lower()
+        if any(token in lower_name for token in ("db walking lunge", "dumbbell walking lunge", "weighted walking lunge")):
+            return "dumbbell"
+        if "walking lunge" in lower_name:
+            return "bodyweight"
         normalized_name = NON_ALNUM_RE.sub("", lower_name)
         for keywords, category in KNOWN_CATEGORY_KEYWORDS:
             for keyword in keywords:

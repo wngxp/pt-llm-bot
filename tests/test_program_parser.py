@@ -94,6 +94,8 @@ Lateral Raises - 3x(5+15)
         self.assertEqual(parser._category_lookup("Close-Grip Incline Press"), "light_barbell")
         self.assertEqual(parser._category_lookup("Arnold Press"), "dumbbell")
         self.assertEqual(parser._category_lookup("Cable Y-Raises"), "cable_machine")
+        self.assertEqual(parser._category_lookup("Walking Lunge"), "bodyweight")
+        self.assertEqual(parser._category_lookup("DB Walking Lunge"), "dumbbell")
 
 
 if __name__ == "__main__":

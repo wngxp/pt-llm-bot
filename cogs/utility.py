@@ -8,7 +8,7 @@ from discord.ext import commands
 from utils.discord_messages import send_discord_text
 
 
-BOT_VERSION = "0.3.0"
+BOT_VERSION = "0.4.1"
 
 
 class UtilityCog(commands.Cog):
@@ -69,22 +69,48 @@ class UtilityCog(commands.Cog):
         self.pending_confirms.pop(key, None)
         return True
 
-    async def _clear_active_workout_sessions(self) -> None:
+    async def _clear_active_workout_sessions(self) -> bool:
         workout_cog = self.bot.get_cog("WorkoutCog")
         if workout_cog is None:
-            return
+            return False
+        cleared = False
         sessions = getattr(workout_cog, "sessions", None)
-        if isinstance(sessions, dict):
+        if isinstance(sessions, dict) and sessions:
             sessions.clear()
+            cleared = True
         early_prompts = getattr(workout_cog, "early_end_prompts", None)
-        if isinstance(early_prompts, dict):
+        if isinstance(early_prompts, dict) and early_prompts:
             early_prompts.clear()
+            cleared = True
         timeout_tasks = getattr(workout_cog, "early_end_timeout_tasks", None)
         if isinstance(timeout_tasks, dict):
+            if timeout_tasks:
+                cleared = True
             for task in timeout_tasks.values():
                 if hasattr(task, "done") and not task.done():
                     task.cancel()
             timeout_tasks.clear()
+        message_map = getattr(workout_cog, "message_log_map", None)
+        if isinstance(message_map, dict) and message_map:
+            message_map.clear()
+            cleared = True
+        user_locks = getattr(workout_cog, "user_locks", None)
+        if isinstance(user_locks, dict) and user_locks:
+            user_locks.clear()
+        return cleared
+
+    def _clear_runtime_memory_state(self) -> None:
+        for cog_name in ("ProgrammeCog", "AskCog", "CheckInCog"):
+            cog = self.bot.get_cog(cog_name)
+            if cog is None:
+                continue
+            clear_runtime = getattr(cog, "clear_runtime_state", None)
+            if callable(clear_runtime):
+                clear_runtime()
+                continue
+            memory = getattr(cog, "memory", None)
+            if memory and hasattr(memory, "clear_all"):
+                memory.clear_all()
 
     @commands.command(name="version")
     async def version_command(self, ctx: commands.Context) -> None:
@@ -169,7 +195,14 @@ class UtilityCog(commands.Cog):
         if idx < 0 or idx >= len(days):
             await send_discord_text(ctx.channel, f"Day must be between 1 and {len(days)}.")
             return
+        ended = await self._clear_active_workout_sessions()
         await self.db.set_current_day_index(idx)
+        if ended:
+            await send_discord_text(
+                ctx.channel,
+                f"Current session ended. Day set to {day_number} ({days[idx]['name']}). Type `ready` to start.",
+            )
+            return
         await send_discord_text(ctx.channel, f"Set current day to Day {day_number} - {days[idx]['name']}.")
 
     @commands.command(name="reset")
@@ -182,6 +215,7 @@ class UtilityCog(commands.Cog):
                 return
             await self.db.wipe_workout_data_preserve_settings()
             await self._clear_active_workout_sessions()
+            self._clear_runtime_memory_state()
             await send_discord_text(ctx.channel, "All workout data wiped. Timezone/settings were preserved.")
             return
         self._start_confirm(ctx.author.id, "reset")

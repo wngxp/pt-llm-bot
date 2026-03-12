@@ -343,6 +343,42 @@ class Database:
             await conn.commit()
         return int(log_id)
 
+    async def get_workout_log(self, log_id: int) -> Optional[dict[str, Any]]:
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT *
+                FROM workout_logs
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (log_id,),
+            )
+        return dict(row) if row else None
+
+    async def update_workout_log(
+        self,
+        log_id: int,
+        *,
+        weight: float,
+        reps: int,
+        unit: str,
+        rir: Optional[int],
+        notes: str,
+    ) -> bool:
+        async with self.connect() as conn:
+            cur = await conn.execute(
+                """
+                UPDATE workout_logs
+                SET weight = ?, reps = ?, unit = ?, rir = ?, notes = ?
+                WHERE id = ?
+                """,
+                (weight, reps, unit, rir, notes, log_id),
+            )
+            await conn.commit()
+        return int(cur.rowcount or 0) > 0
+
     async def get_best_pr(self, exercise_name: str) -> Optional[dict[str, Any]]:
         async with self.connect() as conn:
             row = await self._fetchone(conn, 
@@ -410,6 +446,60 @@ class Database:
             )
             await conn.commit()
         return int(cursor.lastrowid)
+
+    async def delete_pr_for_workout_log(self, workout_log_id: int) -> None:
+        async with self.connect() as conn:
+            await conn.execute(
+                "DELETE FROM personal_records WHERE workout_log_id = ?",
+                (workout_log_id,),
+            )
+            await conn.commit()
+
+    async def get_best_pr_excluding_log(
+        self,
+        exercise_name: str,
+        *,
+        excluded_workout_log_id: int,
+    ) -> Optional[dict[str, Any]]:
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT *
+                FROM personal_records
+                WHERE LOWER(exercise_name) = LOWER(?)
+                  AND (workout_log_id IS NULL OR workout_log_id != ?)
+                ORDER BY estimated_1rm DESC, date DESC
+                LIMIT 1
+                """,
+                (exercise_name, excluded_workout_log_id),
+            )
+            if row:
+                return dict(row)
+
+            fallback = await self._fetchone(
+                conn,
+                """
+                SELECT
+                    e.name AS exercise_name,
+                    wl.weight AS weight,
+                    wl.reps AS reps,
+                    wl.unit AS unit,
+                    (wl.weight * (1 + wl.reps / 30.0)) AS estimated_1rm,
+                    wl.date AS date,
+                    wl.id AS workout_log_id
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE LOWER(e.name) = LOWER(?)
+                  AND wl.id != ?
+                ORDER BY estimated_1rm DESC, wl.date DESC
+                LIMIT 1
+                """,
+                (exercise_name, excluded_workout_log_id),
+            )
+            if fallback:
+                return dict(fallback)
+        return None
 
     async def get_recent_prs(self, days: int = 14) -> list[dict[str, Any]]:
         threshold = (date.today() - timedelta(days=days)).isoformat()

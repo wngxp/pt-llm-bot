@@ -1,3 +1,20 @@
+## [0.4.1] - 2026-03-12
+### Fixed
+- `#programme` review output is now sent as per-day messages, preventing long swap reviews from being cut off mid-sentence.
+- Programme flow now guards against stale post-save LLM replies by serializing per-user handling, tracking flow IDs, and canceling pending review tasks when flow state closes.
+- Post-import day selection now supports implicit replies like `3` and `legs` in addition to `start on day 3`, and writes `current_day_index` with explicit info logging.
+- First-ever compound/bodyweight benchmarks now announce in workout flow and publish to `#prs` as benchmark entries.
+- Bodyweight exercise validation now rejects numeric load entries (for example `225 x 10`) and accepts reps-only input (`10`) as `bw x 10`.
+- `!setday` and `!skipday` now end active workout sessions cleanly before changing day index.
+- `!reset` now clears in-memory conversation/programme flow state across cogs to prevent stale context after a data wipe.
+- Activity muscle-group assignment now uses a deterministic lookup map for common activities (for example climbing/boxing/soccer) instead of unreliable free-form guessing.
+- Activity detection now recognizes common activity keywords even without duration/intensity and logs with sane defaults, prompting for details afterward.
+
+### Added
+- Workout message-edit support: edited set messages now update the original `workout_logs` row, re-check PRs, and confirm with an `✏️ Updated` message.
+- In-memory mapping from Discord `message_id` to logged set metadata for edit-time correction.
+- Startup fresh-DB runtime-state cleanup hook to avoid carrying stale in-memory context when no active program exists.
+
 ## [0.3.0] - 2026-03-12
 ### Fixed
 - Relaxed prompt guardrails so fitness-adjacent requests (equipment swaps, nutrition/recovery topics) are answered normally while still declining prompt-injection attempts.

@@ -148,6 +148,19 @@ class WorkoutSession:
         return self.current_index >= len(self.exercises) and self.superset is None
 
 
+@dataclass(slots=True)
+class LoggedSetMessageRef:
+    workout_log_id: int
+    exercise_id: int
+    exercise_name: str
+    category: str
+    weight: float
+    reps: int
+    unit: str
+    note: str
+    is_bodyweight: bool
+
+
 class WorkoutCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -157,6 +170,7 @@ class WorkoutCog(commands.Cog):
         self.user_locks: dict[int, asyncio.Lock] = {}
         self.early_end_prompts: dict[tuple[int, int], dict[str, Any]] = {}
         self.early_end_timeout_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self.message_log_map: dict[int, LoggedSetMessageRef] = {}
 
     def _is_workout_channel(self, channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel) -> bool:
         cid = getattr(channel, "id", None)
@@ -243,6 +257,25 @@ class WorkoutCog(commands.Cog):
         if lowered in EARLY_END_INTENTS:
             return True
         return any(intent in lowered for intent in EARLY_END_INTENTS)
+
+    def _parse_bodyweight_reps_only(self, text: str) -> Optional[dict[str, Any]]:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        if "x" in lowered or "×" in lowered:
+            return None
+        match = re.fullmatch(
+            r"(?P<reps>\d+)(?:\s*(?:@|rir\s*)(?P<rir>\d+))?(?:\s+(?P<tail>.*))?",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        reps = int(match.group("reps"))
+        rir = int(match.group("rir")) if match.group("rir") else None
+        tail = str(match.group("tail") or "").strip()
+        return {"reps": reps, "rir": rir, "trailing_text": tail}
 
     def _matches_token(self, text: str, tokens: set[str]) -> bool:
         lowered = self._normalize_user_text(text)
@@ -1004,6 +1037,7 @@ class WorkoutCog(commands.Cog):
         unit: str,
         workout_log_id: int,
         category: str,
+        performer_name: Optional[str] = None,
     ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         if weight <= 0:
             logger.debug("PR check skipped for %s because weight <= 0", exercise_name)
@@ -1012,10 +1046,16 @@ class WorkoutCog(commands.Cog):
         key = exercise_name.strip().lower()
         e1rm = epley_1rm(weight, reps)
         existing = await self.db.get_best_pr(exercise_name)
+        logger.info(
+            "PR check for %s: new_e1rm=%.2f best=%s",
+            exercise_name,
+            e1rm,
+            f"{float(existing.get('estimated_1rm') or 0.0):.2f}" if existing else "None",
+        )
         announce_categories = {"heavy_barbell", "light_barbell", "bodyweight"}
 
         if not existing:
-            logger.debug("PR baseline created for %s: %s %s x %s", exercise_name, weight, unit, reps)
+            logger.info("PR baseline created for %s: %s %s x %s", exercise_name, weight, unit, reps)
             await self.db.create_pr(
                 exercise_name,
                 weight=weight,
@@ -1027,10 +1067,21 @@ class WorkoutCog(commands.Cog):
             )
             session.baseline_exercises.add(key)
             if category in announce_categories:
+                payload = {
+                    "exercise_name": exercise_name,
+                    "weight": weight,
+                    "reps": reps,
+                    "unit": unit,
+                    "e1rm": e1rm,
+                    "previous": None,
+                    "is_first_benchmark": True,
+                    "performer_name": performer_name or "",
+                }
+                self.bot.dispatch("pr_hit", payload)
                 return (
-                    None,
+                    payload,
                     (
-                        f"🏁 First {exercise_name} logged! "
+                        f"📊 First {exercise_name} logged! "
                         f"{format_standard_number(weight)} {unit} x {reps} - this is your starting benchmark."
                     ),
                 )
@@ -1057,7 +1108,7 @@ class WorkoutCog(commands.Cog):
             )
             return None, None
 
-        logger.debug(
+        logger.info(
             "PR hit for %s: type=%s new=%.2f prev=%.2f",
             exercise_name,
             pr_type,
@@ -1074,9 +1125,6 @@ class WorkoutCog(commands.Cog):
             workout_log_id=workout_log_id,
         )
 
-        if key in session.baseline_exercises:
-            return None, None
-
         if category not in announce_categories:
             return None, None
 
@@ -1087,6 +1135,8 @@ class WorkoutCog(commands.Cog):
             "unit": unit,
             "e1rm": e1rm,
             "previous": existing,
+            "is_first_benchmark": False,
+            "performer_name": performer_name or "",
         }
         self.bot.dispatch("pr_hit", payload)
         short_message = (
@@ -1095,11 +1145,103 @@ class WorkoutCog(commands.Cog):
         )
         return payload, short_message
 
+    async def _recheck_pr_after_edit(
+        self,
+        *,
+        exercise_name: str,
+        weight: float,
+        reps: int,
+        unit: str,
+        workout_log_id: int,
+        category: str,
+        performer_name: Optional[str] = None,
+    ) -> Optional[str]:
+        if weight <= 0:
+            return None
+        announce_categories = {"heavy_barbell", "light_barbell", "bodyweight"}
+        e1rm = epley_1rm(weight, reps)
+        existing = await self.db.get_best_pr_excluding_log(
+            exercise_name,
+            excluded_workout_log_id=workout_log_id,
+        )
+        logger.info(
+            "PR recheck(edit) for %s: new_e1rm=%.2f best_excluding=%s",
+            exercise_name,
+            e1rm,
+            f"{float(existing.get('estimated_1rm') or 0.0):.2f}" if existing else "None",
+        )
+
+        if not existing:
+            await self.db.create_pr(
+                exercise_name,
+                weight=weight,
+                reps=reps,
+                unit=unit,
+                estimated_1rm=e1rm,
+                workout_date=date.today(),
+                workout_log_id=workout_log_id,
+            )
+            if category in announce_categories:
+                payload = {
+                    "exercise_name": exercise_name,
+                    "weight": weight,
+                    "reps": reps,
+                    "unit": unit,
+                    "e1rm": e1rm,
+                    "previous": None,
+                    "is_first_benchmark": True,
+                    "performer_name": performer_name or "",
+                }
+                self.bot.dispatch("pr_hit", payload)
+                return (
+                    f"📊 First {exercise_name} logged! "
+                    f"{format_standard_number(weight)} {unit} x {reps} - this is your starting benchmark."
+                )
+            return None
+
+        prev_e1rm = float(existing.get("estimated_1rm") or 0.0)
+        prev_weight = float(existing.get("weight") or 0.0)
+        prev_reps = int(existing.get("reps") or 0)
+
+        is_pr = e1rm > prev_e1rm or (weight > prev_weight and reps >= prev_reps) or (reps > prev_reps and weight >= prev_weight)
+        if not is_pr:
+            return None
+
+        await self.db.create_pr(
+            exercise_name,
+            weight=weight,
+            reps=reps,
+            unit=unit,
+            estimated_1rm=e1rm,
+            workout_date=date.today(),
+            workout_log_id=workout_log_id,
+        )
+        if category in announce_categories:
+            payload = {
+                "exercise_name": exercise_name,
+                "weight": weight,
+                "reps": reps,
+                "unit": unit,
+                "e1rm": e1rm,
+                "previous": existing,
+                "is_first_benchmark": False,
+                "performer_name": performer_name or "",
+            }
+            self.bot.dispatch("pr_hit", payload)
+            return (
+                f"🏆 PR! {format_standard_number(weight)}{unit} x {reps} "
+                f"(e1RM: {format_standard_number(e1rm)})"
+            )
+        return None
+
     async def _handle_logged_set(
         self,
         channel: discord.abc.Messageable,
         session: WorkoutSession,
         parsed: dict[str, Any],
+        *,
+        message_id: Optional[int] = None,
+        performer_name: Optional[str] = None,
     ) -> None:
         target = await self._resolve_target_exercise(session, parsed)
         if not target:
@@ -1147,6 +1289,12 @@ class WorkoutCog(commands.Cog):
                 f"{target['name']} is a {category.replace('_', ' ')} exercise - log a weight like `30 x 10`.",
             )
             return
+        if category == "bodyweight" and not is_bodyweight:
+            await send_discord_text(
+                channel,
+                f"{target['name']} is a bodyweight exercise. Log as `bw x 10` or `bw+25 x 10` for weighted.",
+            )
+            return
 
         weight = float(parsed["weight"])
         max_weight = MAX_WEIGHT_BY_UNIT.get(str(unit), 1500.0)
@@ -1180,6 +1328,7 @@ class WorkoutCog(commands.Cog):
             str(unit),
             log_id,
             category,
+            performer_name=performer_name,
         )
         if pr_payload:
             session.pr_events.append(pr_payload)
@@ -1209,6 +1358,7 @@ class WorkoutCog(commands.Cog):
         e1rm_value = epley_1rm(weight, reps) if weight > 0 else 0.0
         session.logged_sets.append(
             {
+                "workout_log_id": log_id,
                 "exercise_name": str(target["name"]),
                 "weight": weight,
                 "reps": reps,
@@ -1218,6 +1368,18 @@ class WorkoutCog(commands.Cog):
                 "note": note,
             }
         )
+        if message_id is not None:
+            self.message_log_map[int(message_id)] = LoggedSetMessageRef(
+                workout_log_id=log_id,
+                exercise_id=ex_id,
+                exercise_name=str(target["name"]),
+                category=category,
+                weight=weight,
+                reps=reps,
+                unit=str(unit),
+                note=note,
+                is_bodyweight=bool(parsed.get("is_bodyweight")),
+            )
 
         if session.superset:
             await self._advance_superset(channel, session)
@@ -1368,12 +1530,15 @@ class WorkoutCog(commands.Cog):
                 await send_discord_text(channel, "No active program days available.")
             return
 
-        active_session = self.sessions.get(getattr(channel, "id", 0))
-        if active_session:
-            await self._cancel_rest(active_session)
-            self.sessions.pop(active_session.channel_id, None)
-            self._clear_early_end_prompts_for_channel(active_session.channel_id)
-            await send_discord_text(channel, "Ended current session and applied day skip.")
+        ended_any = False
+        if self.sessions:
+            for active_session in list(self.sessions.values()):
+                await self._cancel_rest(active_session)
+                self._clear_early_end_prompts_for_channel(active_session.channel_id)
+            self.sessions.clear()
+            ended_any = True
+        if ended_any:
+            await send_discord_text(channel, "Current session ended before applying day change.")
 
         await self.db.set_current_day_index(idx)
         await send_discord_text(
@@ -1412,14 +1577,10 @@ class WorkoutCog(commands.Cog):
 
     @commands.command(name="skipday")
     async def skipday_command(self, ctx: commands.Context, *, target: str) -> None:
-        if not self._is_workout_channel(ctx.channel):
-            return
         await self._skip_to_day(ctx.channel, target)
 
     @commands.command(name="goto")
     async def goto_command(self, ctx: commands.Context, *, day_name_or_number: str) -> None:
-        if not self._is_workout_channel(ctx.channel):
-            return
         await self._skip_to_day(ctx.channel, day_name_or_number)
 
     @commands.command(name="plates")
@@ -1479,6 +1640,158 @@ class WorkoutCog(commands.Cog):
         csv_path = write_logs_csv(rows, stem=stem)
         await send_discord_file(ctx.channel, file=discord.File(str(csv_path)))
         await self._maybe_send_settings_tip(ctx.channel)
+
+    def _format_load_display(self, *, weight: float, unit: str, note: str, is_bodyweight: bool, reps: int) -> str:
+        if is_bodyweight:
+            load = note or "bodyweight"
+            return f"{load} x {reps}"
+        return f"{format_standard_number(weight)} {unit} x {reps}"
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        if after.author.bot:
+            return
+        if before.content == after.content:
+            return
+        if not self._is_workout_channel(after.channel):
+            return
+
+        ref = self.message_log_map.get(after.id)
+        if ref is None:
+            return
+
+        content = after.content.strip()
+        if not content:
+            return
+
+        lock = self._get_user_lock(after.author.id)
+        async with lock:
+            ref = self.message_log_map.get(after.id)
+            if ref is None:
+                return
+
+            parsed = parse_set_input(content)
+            if not parsed and ref.category == "bodyweight":
+                reps_only = self._parse_bodyweight_reps_only(content)
+                if reps_only:
+                    parsed = {
+                        "exercise": None,
+                        "weight": 0.0,
+                        "reps": int(reps_only["reps"]),
+                        "unit": None,
+                        "unit_explicit": False,
+                        "rir": reps_only.get("rir"),
+                        "is_bodyweight": True,
+                        "note": "bodyweight",
+                        "trailing_text": str(reps_only.get("trailing_text") or "").strip(),
+                    }
+            if not parsed:
+                await send_discord_text(after.channel, "I couldn't parse the edited set. Use `weight x reps`.")
+                return
+
+            category = ref.category
+            is_bodyweight = bool(parsed.get("is_bodyweight"))
+            if is_bodyweight and category != "bodyweight":
+                await send_discord_text(
+                    after.channel,
+                    f"{ref.exercise_name} is a {category.replace('_', ' ')} exercise - log a weight like `30 x 10`.",
+                )
+                return
+            if category == "bodyweight" and not is_bodyweight:
+                await send_discord_text(
+                    after.channel,
+                    f"{ref.exercise_name} is a bodyweight exercise. Log as `bw x 10` or `bw+25 x 10` for weighted.",
+                )
+                return
+
+            reps = int(parsed.get("reps") or 0)
+            if reps <= 0:
+                await send_discord_text(after.channel, "Reps must be greater than zero.")
+                return
+            if reps > MAX_REPS:
+                await send_discord_text(after.channel, "That rep count seems unrealistic.")
+                return
+
+            unit = str(parsed.get("unit") or ref.unit)
+            weight = float(parsed.get("weight") or 0.0)
+            if category != "bodyweight" and unit not in {"lbs", "kg"}:
+                unit = "lbs"
+            max_weight = MAX_WEIGHT_BY_UNIT.get(unit, 1500.0)
+            if abs(weight) > max_weight:
+                await send_discord_text(after.channel, "That weight seems unrealistic. Please double-check.")
+                return
+
+            parsed_note = str(parsed.get("note") or "").strip()
+            trailing_text = str(parsed.get("trailing_text") or "").strip()
+            note_parts = [part for part in [parsed_note, trailing_text] if part]
+            note = "; ".join(note_parts)
+
+            updated = await self.db.update_workout_log(
+                ref.workout_log_id,
+                weight=weight,
+                reps=reps,
+                unit=unit,
+                rir=parsed.get("rir"),
+                notes=note,
+            )
+            if not updated:
+                await send_discord_text(after.channel, "Couldn't update that set in the database.")
+                return
+
+            await self.db.delete_pr_for_workout_log(ref.workout_log_id)
+            pr_text = await self._recheck_pr_after_edit(
+                exercise_name=ref.exercise_name,
+                weight=weight,
+                reps=reps,
+                unit=unit,
+                workout_log_id=ref.workout_log_id,
+                category=category,
+                performer_name=getattr(after.author, "display_name", str(after.author)),
+            )
+
+            old_display = self._format_load_display(
+                weight=ref.weight,
+                unit=ref.unit,
+                note=ref.note,
+                is_bodyweight=ref.is_bodyweight,
+                reps=ref.reps,
+            )
+            new_display = self._format_load_display(
+                weight=weight,
+                unit=unit,
+                note=note,
+                is_bodyweight=is_bodyweight,
+                reps=reps,
+            )
+            update_message = f"✏️ Updated: {ref.exercise_name} — {new_display} (was {old_display})"
+            if pr_text:
+                update_message = f"{update_message} | {pr_text}"
+            await send_discord_text(after.channel, update_message)
+
+            active_session = self.sessions.get(after.channel.id)
+            if active_session:
+                for row in active_session.logged_sets:
+                    if int(row.get("workout_log_id") or -1) != ref.workout_log_id:
+                        continue
+                    row["weight"] = weight
+                    row["reps"] = reps
+                    row["unit"] = unit
+                    row["e1rm"] = epley_1rm(weight, reps) if weight > 0 else 0.0
+                    row["is_bodyweight"] = is_bodyweight
+                    row["note"] = note
+                    break
+
+            self.message_log_map[after.id] = LoggedSetMessageRef(
+                workout_log_id=ref.workout_log_id,
+                exercise_id=ref.exercise_id,
+                exercise_name=ref.exercise_name,
+                category=ref.category,
+                weight=weight,
+                reps=reps,
+                unit=unit,
+                note=note,
+                is_bodyweight=is_bodyweight,
+            )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -1564,6 +1877,22 @@ class WorkoutCog(commands.Cog):
                 return
 
             parsed = parse_set_input(content)
+            if not parsed:
+                current = session.current_exercise()
+                current_category = str(current.get("category") or "") if current else ""
+                reps_only = self._parse_bodyweight_reps_only(content) if current_category == "bodyweight" else None
+                if reps_only:
+                    parsed = {
+                        "exercise": None,
+                        "weight": 0.0,
+                        "reps": int(reps_only["reps"]),
+                        "unit": None,
+                        "unit_explicit": False,
+                        "rir": reps_only.get("rir"),
+                        "is_bodyweight": True,
+                        "note": "bodyweight",
+                        "trailing_text": str(reps_only.get("trailing_text") or "").strip(),
+                    }
             if parsed:
                 if session.rest_task and not session.rest_task.done():
                     await send_discord_text(
@@ -1572,7 +1901,13 @@ class WorkoutCog(commands.Cog):
                     )
                     return
                 parsed["raw"] = content
-                await self._handle_logged_set(message.channel, session, parsed)
+                await self._handle_logged_set(
+                    message.channel,
+                    session,
+                    parsed,
+                    message_id=message.id,
+                    performer_name=getattr(message.author, "display_name", str(message.author)),
+                )
                 return
 
             cue = parse_cue(content)

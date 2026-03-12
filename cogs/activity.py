@@ -39,6 +39,34 @@ MUSCLE_KEYWORDS: dict[str, str] = {
     "pec": "chest",
     "chest": "chest",
 }
+ACTIVITY_MUSCLE_MAP: dict[str, str] = {
+    "rock climbing": "back, forearms, biceps, core, shoulders",
+    "climbing": "back, forearms, biceps, core, shoulders",
+    "bouldering": "back, forearms, biceps, core, shoulders",
+    "running": "quads, hamstrings, calves, cardiovascular",
+    "jogging": "quads, hamstrings, calves, cardiovascular",
+    "cycling": "quads, hamstrings, calves, cardiovascular",
+    "swimming": "back, shoulders, chest, core, cardiovascular",
+    "soccer": "quads, hamstrings, calves, core, cardiovascular",
+    "football": "quads, hamstrings, calves, core, cardiovascular",
+    "basketball": "quads, hamstrings, calves, shoulders, cardiovascular",
+    "tennis": "shoulders, forearms, core, quads, cardiovascular",
+    "boxing": "shoulders, chest, core, arms, cardiovascular",
+    "kickboxing": "shoulders, chest, core, arms, quads, hamstrings, cardiovascular",
+    "hiking": "quads, hamstrings, calves, core",
+    "yoga": "core, flexibility, full body",
+    "skiing": "quads, hamstrings, core, calves",
+    "snowboarding": "quads, hamstrings, core, calves",
+    "rowing": "back, biceps, core, shoulders, cardiovascular",
+    "volleyball": "shoulders, quads, calves, core",
+    "martial arts": "full body, cardiovascular",
+    "wrestling": "full body, cardiovascular",
+    "jump rope": "calves, shoulders, cardiovascular",
+    "sprinting": "quads, hamstrings, glutes, calves, cardiovascular",
+}
+HIGH_INTENSITY_HINTS = {"hard", "intense", "all out", "max effort", "very hard", "brutal"}
+LOW_INTENSITY_HINTS = {"easy", "light", "recovery", "very easy"}
+MODERATE_INTENSITY_HINTS = {"moderate", "medium"}
 
 
 class ActivityCog(commands.Cog):
@@ -81,6 +109,8 @@ class ActivityCog(commands.Cog):
         return datetime.now(tzinfo).date()
 
     def _looks_like_activity_report(self, text: str) -> bool:
+        if self._match_known_activity(text):
+            return True
         return bool(ACTIVITY_VERB_RE.search(text) and ACTIVITY_DESCRIPTOR_RE.search(text))
 
     def _looks_like_injury_report(self, text: str) -> bool:
@@ -93,6 +123,26 @@ class ActivityCog(commands.Cog):
             if key in lowered:
                 groups.add(group)
         return ",".join(sorted(groups)) if groups else "general"
+
+    def _match_known_activity(self, text: str) -> str | None:
+        lowered = text.lower()
+        for key in sorted(ACTIVITY_MUSCLE_MAP.keys(), key=len, reverse=True):
+            if key in lowered:
+                return key
+        return None
+
+    def _infer_intensity(self, text: str) -> str:
+        lowered = text.lower()
+        if any(token in lowered for token in HIGH_INTENSITY_HINTS):
+            return "high"
+        if any(token in lowered for token in LOW_INTENSITY_HINTS):
+            return "low"
+        if any(token in lowered for token in MODERATE_INTENSITY_HINTS):
+            return "moderate"
+        return "moderate"
+
+    def _has_duration_or_descriptor(self, text: str) -> bool:
+        return bool(ACTIVITY_DESCRIPTOR_RE.search(text))
 
     def _normalize_activity_classification(self, text: str, classification: dict[str, Any]) -> dict[str, Any]:
         out = dict(classification)
@@ -147,6 +197,14 @@ class ActivityCog(commands.Cog):
         return f"Estimated recovery: ~{recovery_days} day(s) for {', '.join(groups)}."
 
     async def _classify_activity(self, text: str) -> dict[str, Any]:
+        known = self._match_known_activity(text)
+        if known:
+            return {
+                "activity_type": known,
+                "intensity": self._infer_intensity(text),
+                "muscle_groups": ACTIVITY_MUSCLE_MAP[known],
+                "short_note": text,
+            }
         try:
             out = await self.bot.ollama.chat_json(
                 system=ACTIVITY_IMPACT_SYSTEM_PROMPT,
@@ -169,6 +227,13 @@ class ActivityCog(commands.Cog):
 
     async def _handle_activity_text(self, channel: discord.abc.Messageable, content: str) -> None:
         today_local = await self._local_today()
+        known_activity = self._match_known_activity(content)
+        if known_activity and "?" in content and not ACTIVITY_VERB_RE.search(content) and not self._has_duration_or_descriptor(content):
+            await send_discord_text(
+                channel,
+                f"If you want to log {known_activity}, send something like `{known_activity} 1 hour moderate`.",
+            )
+            return
 
         if self._looks_like_injury_report(content):
             groups = self._extract_injury_groups(content)
@@ -185,7 +250,7 @@ class ActivityCog(commands.Cog):
             )
             return
 
-        if self._looks_like_activity_report(content):
+        if known_activity or self._looks_like_activity_report(content):
             classification = await self._classify_activity(content)
             classification = self._normalize_activity_classification(content, classification)
             await self.db.add_activity(
@@ -205,6 +270,12 @@ class ActivityCog(commands.Cog):
                 f"({classification['intensity']}) affecting [{classification['muscle_groups'] or 'unspecified'}].\n"
                 f"{recovery_note}",
             )
+            if known_activity and not self._has_duration_or_descriptor(content):
+                await send_discord_text(
+                    channel,
+                    f"If you want a more accurate adjustment, reply with duration/intensity for {known_activity} "
+                    "(for example `1 hour moderate`).",
+                )
             return
 
         if "?" in content:

@@ -30,6 +30,9 @@ class AskCog(commands.Cog):
         self.db = bot.db
         self.memory = ConversationMemory(max_messages=10, ttl_minutes=30)
 
+    def clear_runtime_state(self) -> None:
+        self.memory.clear_all()
+
     def _is_ask_channel(self, channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel) -> bool:
         cid = getattr(channel, "id", None)
         name = getattr(channel, "name", "")

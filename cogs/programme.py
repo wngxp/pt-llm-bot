@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+from uuid import uuid4
 
 import discord
 from discord.ext import commands
@@ -24,6 +26,8 @@ SET_PATTERN_RE = re.compile(r"\d+\s*[xX×]\s*\d+")
 PENDING_CONFIRM_TOKENS = {"save", "confirm", "import", "looks good", "ship it", "yes"}
 PENDING_CANCEL_TOKENS = {"cancel", "stop", "never mind", "discard"}
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class PendingProgram:
@@ -33,6 +37,7 @@ class PendingProgram:
     created_at: datetime
     notes: list[str] = field(default_factory=list)
     latest_suggestions: str = ""
+    flow_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 class ProgrammeCog(commands.Cog):
@@ -43,7 +48,17 @@ class ProgrammeCog(commands.Cog):
         self.parser = ProgramParser(bot.ollama)
         self.post_import_state: dict[int, dict[str, Any]] = {}
         self.pending_programs: dict[tuple[int, int], PendingProgram] = {}
+        self.review_tasks: dict[tuple[int, int], asyncio.Task[list[str]]] = {}
+        self.closed_flows: dict[tuple[int, int], tuple[str, datetime]] = {}
+        self.user_locks: dict[int, asyncio.Lock] = {}
         self.memory = ConversationMemory(max_messages=10, ttl_minutes=30)
+
+    def _get_user_lock(self, user_id: int) -> asyncio.Lock:
+        lock = self.user_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.user_locks[user_id] = lock
+        return lock
 
     def _is_programme_channel(self, channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel) -> bool:
         cid = getattr(channel, "id", None)
@@ -108,6 +123,12 @@ class ProgrammeCog(commands.Cog):
         return re.sub(r"[^a-z0-9]+", "", text.lower())
 
     def _parse_start_day_index(self, text: str, days: list[dict[str, Any]]) -> Optional[int]:
+        plain_num = re.fullmatch(r"\s*(\d+)\s*", text)
+        if plain_num:
+            idx = int(plain_num.group(1)) - 1
+            if 0 <= idx < len(days):
+                return idx
+
         match = DAY_NUMBER_RE.search(text)
         if match:
             idx = int(match.group("day_num")) - 1
@@ -142,10 +163,45 @@ class ProgrammeCog(commands.Cog):
         return state
 
     def _set_pending_program(self, state: PendingProgram) -> None:
-        self.pending_programs[self._pending_key(state.user_id, state.channel_id)] = state
+        key = self._pending_key(state.user_id, state.channel_id)
+        self.pending_programs[key] = state
+        closed = self.closed_flows.get(key)
+        if closed and closed[0] == state.flow_id:
+            self.closed_flows.pop(key, None)
 
     def _clear_pending_program(self, user_id: int, channel_id: int) -> None:
         self.pending_programs.pop(self._pending_key(user_id, channel_id), None)
+
+    def _is_flow_closed(self, user_id: int, channel_id: int, flow_id: str) -> bool:
+        key = self._pending_key(user_id, channel_id)
+        record = self.closed_flows.get(key)
+        if not record:
+            return False
+        closed_flow, expires_at = record
+        if expires_at < self._now_utc():
+            self.closed_flows.pop(key, None)
+            return False
+        return closed_flow == flow_id
+
+    def _mark_flow_closed(self, user_id: int, channel_id: int, flow_id: str) -> None:
+        self.closed_flows[self._pending_key(user_id, channel_id)] = (
+            flow_id,
+            self._now_utc() + timedelta(minutes=10),
+        )
+
+    def _is_pending_flow_active(self, state: PendingProgram) -> bool:
+        if self._is_flow_closed(state.user_id, state.channel_id, state.flow_id):
+            return False
+        current = self._get_pending_program(state.user_id, state.channel_id)
+        if not current:
+            return False
+        return current.flow_id == state.flow_id
+
+    def _cancel_review_task(self, user_id: int, channel_id: int) -> None:
+        key = self._pending_key(user_id, channel_id)
+        task = self.review_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
 
     def _extract_exercise_summary(self, raw_text: str) -> list[dict[str, Any]]:
         blocks = self.parser._extract_day_blocks(raw_text)
@@ -170,9 +226,24 @@ class ProgrammeCog(commands.Cog):
         return summary
 
     def _clear_programme_flow_state(self, user_id: int, channel_id: int) -> None:
+        pending = self._get_pending_program(user_id, channel_id)
+        if pending:
+            self._mark_flow_closed(user_id, channel_id, pending.flow_id)
+        self._cancel_review_task(user_id, channel_id)
         self._clear_pending_program(user_id, channel_id)
         self._clear_post_import_context(user_id)
         self.memory.clear(user_id=user_id, channel_id=channel_id)
+
+    def clear_runtime_state(self) -> None:
+        for task in self.review_tasks.values():
+            if task and not task.done():
+                task.cancel()
+        self.review_tasks.clear()
+        self.post_import_state.clear()
+        self.pending_programs.clear()
+        self.closed_flows.clear()
+        self.user_locks.clear()
+        self.memory.clear_all()
 
     def _is_confirm_message(self, text: str) -> bool:
         normalized = " ".join(text.strip().lower().split())
@@ -220,16 +291,28 @@ class ProgrammeCog(commands.Cog):
         lines.append("Reply with `start on Legs` or `start on Day 3`.")
         await send_discord_text(channel, "\n".join(lines))
 
-    async def _handle_start_day_message(self, channel: discord.abc.Messageable, text: str) -> bool:
-        active = await self.db.get_active_program()
-        if not active:
-            return False
-        days = await self.db.get_program_days(int(active["id"]))
+    async def _handle_start_day_message(
+        self,
+        channel: discord.abc.Messageable,
+        text: str,
+        *,
+        program_id: Optional[int] = None,
+        allow_implicit: bool = False,
+        user_id: Optional[int] = None,
+    ) -> bool:
+        if program_id is None:
+            active = await self.db.get_active_program()
+            if not active:
+                return False
+            program_id = int(active["id"])
+
+        days = await self.db.get_program_days(program_id)
         if not days:
             return False
 
         lowered = text.lower()
-        if not START_DAY_INTENT_RE.search(lowered) and not DAY_NUMBER_RE.search(lowered):
+        has_intent = bool(START_DAY_INTENT_RE.search(lowered) or DAY_NUMBER_RE.search(lowered))
+        if not allow_implicit and not has_intent:
             return False
 
         idx = self._parse_start_day_index(text, days)
@@ -241,6 +324,7 @@ class ProgrammeCog(commands.Cog):
             return True
 
         await self.db.set_current_day_index(idx)
+        logger.info("Set current_day_index to %s for user %s", idx, user_id if user_id is not None else "unknown")
         selected = next((d for d in days if int(d["day_order"]) == idx), days[idx])
         await send_discord_text(
             channel,
@@ -332,6 +416,61 @@ class ProgrammeCog(commands.Cog):
         )
         return reply.strip()
 
+    async def _suggest_pending_changes_by_day(self, state: PendingProgram) -> list[str]:
+        history = self.memory.get(user_id=state.user_id, channel_id=state.channel_id)
+        day_blocks = self.parser._extract_day_blocks(state.raw_text)
+        if not day_blocks:
+            single = await self._suggest_pending_changes(state)
+            return [single]
+
+        messages: list[str] = []
+        for idx, block in enumerate(day_blocks):
+            day_name = str(block.get("name") or f"Day {idx + 1}")
+            exercises = block.get("exercises") or []
+            payload = {
+                "day_name": day_name,
+                "day_order": idx + 1,
+                "exercises": exercises,
+                "user_constraints": state.notes,
+                "history": history,
+                "task": "Give focused swap suggestions for this day only.",
+                "format": "Use 3-6 short bullets. Mention only actionable edits.",
+            }
+            try:
+                review = await self.bot.ollama.chat(
+                    system=(
+                        f"{FITNESS_ONLY_GUARDRAIL}\n"
+                        "You are reviewing one training day before import. "
+                        "Focus on practical swaps and consistency. "
+                        "If discussing Smith Machine swaps: only suggest Smith alternatives for heavy_barbell/light_barbell exercises. "
+                        "Never relabel dumbbell/cable/machine/bodyweight lifts as Smith Machine."
+                    ),
+                    user=json.dumps(payload, ensure_ascii=False),
+                    temperature=0.2,
+                    max_tokens=260,
+                )
+                body = review.strip() or "No major swaps needed for this day."
+            except Exception:
+                body = "No major swaps needed for this day."
+            messages.append(f"**Day {idx + 1} - {day_name}**\n{body}")
+        return messages
+
+    async def _send_day_reviews(
+        self,
+        channel: discord.abc.Messageable,
+        day_reviews: list[str],
+        *,
+        updated: bool = False,
+    ) -> None:
+        header = "Updated review by day:" if updated else "I reviewed your program before importing:"
+        await send_discord_text(channel, header)
+        for review in day_reviews:
+            await send_discord_text(channel, review)
+        await send_discord_text(
+            channel,
+            "Reply with edits if you want changes, `save` to import, or `cancel` to discard.",
+        )
+
     async def _render_program_for_import(self, state: PendingProgram) -> str:
         if not state.notes:
             return state.raw_text
@@ -404,6 +543,7 @@ class ProgrammeCog(commands.Cog):
         author: discord.abc.User,
         raw_text: str,
     ) -> None:
+        self._cancel_review_task(author.id, getattr(channel, "id", 0))
         state = PendingProgram(
             user_id=author.id,
             channel_id=getattr(channel, "id", 0),
@@ -411,14 +551,12 @@ class ProgrammeCog(commands.Cog):
             created_at=self._now_utc(),
         )
         self._set_pending_program(state)
-        suggestions = await self._suggest_pending_changes(state)
-        state.latest_suggestions = suggestions
+        day_reviews = await self._suggest_pending_changes_by_day(state)
+        if not self._is_pending_flow_active(state):
+            return
+        state.latest_suggestions = "\n\n".join(day_reviews)
         self._set_pending_program(state)
-        await send_discord_text(
-            channel,
-            f"I reviewed your program before importing.\n\n{suggestions}\n\n"
-            "Reply with edits if you want changes, `save` to import, or `cancel` to discard.",
-        )
+        await self._send_day_reviews(channel, day_reviews, updated=False)
 
     async def _finalize_pending_program(
         self,
@@ -426,6 +564,7 @@ class ProgrammeCog(commands.Cog):
         author: discord.abc.User,
         state: PendingProgram,
     ) -> None:
+        self._cancel_review_task(state.user_id, state.channel_id)
         final_text = state.raw_text
         try:
             final_text = await self._render_program_for_import(state)
@@ -442,6 +581,7 @@ class ProgrammeCog(commands.Cog):
         )
         recent = await self.db.get_recent_program_by_name(parsed["program_name"], minutes=5)
         if recent:
+            self._mark_flow_closed(state.user_id, state.channel_id, state.flow_id)
             self._clear_pending_program(state.user_id, state.channel_id)
             await send_discord_text(
                 channel,
@@ -455,6 +595,7 @@ class ProgrammeCog(commands.Cog):
 
         days = parsed.get("days", [])
         total_exercises = sum(len(day.get("exercises", [])) for day in days)
+        self._mark_flow_closed(state.user_id, state.channel_id, state.flow_id)
         self._clear_pending_program(state.user_id, state.channel_id)
         await send_discord_text(
             channel,
@@ -556,7 +697,9 @@ class ProgrammeCog(commands.Cog):
     async def import_program_command(self, ctx: commands.Context, *, text: str) -> None:
         if not self._is_programme_channel(ctx.channel):
             return
-        await self._start_pending_program(ctx.channel, ctx.author, text)
+        lock = self._get_user_lock(ctx.author.id)
+        async with lock:
+            await self._start_pending_program(ctx.channel, ctx.author, text)
 
     @commands.command(name="program")
     async def show_program_command(self, ctx: commands.Context) -> None:
@@ -579,17 +722,25 @@ class ProgrammeCog(commands.Cog):
     async def start_day_command(self, ctx: commands.Context, *, text: str) -> None:
         if not self._is_programme_channel(ctx.channel):
             return
-        handled = await self._handle_start_day_message(ctx.channel, f"start on {text}")
-        if not handled:
-            await send_discord_text(ctx.channel, "Couldn't parse that day selection. Try `!startday Day 3` or `!startday Legs`.")
-            return
-        context = self._get_post_import_context(ctx.author.id, ctx.channel.id)
-        if context:
-            self._clear_programme_flow_state(ctx.author.id, ctx.channel.id)
-            await send_discord_text(
+        lock = self._get_user_lock(ctx.author.id)
+        async with lock:
+            context = self._get_post_import_context(ctx.author.id, ctx.channel.id)
+            handled = await self._handle_start_day_message(
                 ctx.channel,
-                "Program saved and ready. Head to your workout channel and type `ready` to start.",
+                f"start on {text}",
+                program_id=int(context["program_id"]) if context else None,
+                allow_implicit=bool(context),
+                user_id=ctx.author.id,
             )
+            if not handled:
+                await send_discord_text(ctx.channel, "Couldn't parse that day selection. Try `!startday Day 3` or `!startday Legs`.")
+                return
+            if context:
+                self._clear_programme_flow_state(ctx.author.id, ctx.channel.id)
+                await send_discord_text(
+                    ctx.channel,
+                    "Program saved and ready. Head to your workout channel and type `ready` to start.",
+                )
 
     @commands.command(name="travel")
     async def travel_program_command(self, ctx: commands.Context, *, text: str) -> None:
@@ -648,60 +799,77 @@ class ProgrammeCog(commands.Cog):
 
         user_id = message.author.id
         channel_id = message.channel.id
-        context = self._get_post_import_context(user_id, channel_id)
-        self.memory.append(user_id=user_id, channel_id=channel_id, role="user", content=content)
+        lock = self._get_user_lock(user_id)
+        async with lock:
+            context = self._get_post_import_context(user_id, channel_id)
+            self.memory.append(user_id=user_id, channel_id=channel_id, role="user", content=content)
 
-        pending = self._get_pending_program(user_id, channel_id)
+            pending = self._get_pending_program(user_id, channel_id)
 
-        if self._looks_like_program_paste(content):
-            try:
-                await self._start_pending_program(message.channel, message.author, content)
-            except Exception as exc:
-                await send_discord_text(message.channel, f"Could not process program draft: {exc}")
-            return
-
-        if pending:
-            if self._is_cancel_message(content):
-                self._clear_programme_flow_state(user_id, channel_id)
-                await send_discord_text(message.channel, "Pending program import discarded.")
-                return
-            if self._is_confirm_message(content):
+            if self._looks_like_program_paste(content):
                 try:
-                    await self._finalize_pending_program(message.channel, message.author, pending)
+                    await self._start_pending_program(message.channel, message.author, content)
                 except Exception as exc:
-                    await send_discord_text(message.channel, f"Could not import program: {exc}")
+                    await send_discord_text(message.channel, f"Could not process program draft: {exc}")
                 return
-            pending.notes.append(content)
-            pending.created_at = self._now_utc()
-            self._set_pending_program(pending)
-            try:
-                pending.latest_suggestions = await self._suggest_pending_changes(pending)
+
+            if pending:
+                if self._is_cancel_message(content):
+                    self._clear_programme_flow_state(user_id, channel_id)
+                    await send_discord_text(message.channel, "Pending program import discarded.")
+                    return
+                if self._is_confirm_message(content):
+                    try:
+                        await self._finalize_pending_program(message.channel, message.author, pending)
+                    except Exception as exc:
+                        await send_discord_text(message.channel, f"Could not import program: {exc}")
+                    return
+                pending.notes.append(content)
+                pending.created_at = self._now_utc()
                 self._set_pending_program(pending)
-                await send_discord_text(
-                    message.channel,
-                    f"Updated suggestions:\n\n{pending.latest_suggestions}\n\n"
-                    "Reply with more edits, `save` to import, or `cancel`.",
-                )
-            except Exception:
-                await send_discord_text(
-                    message.channel,
-                    "I noted that change request. Reply `save` when you're ready to import, or keep editing.",
-                )
-            return
+                key = self._pending_key(user_id, channel_id)
+                self._cancel_review_task(user_id, channel_id)
+                review_task = asyncio.create_task(self._suggest_pending_changes_by_day(pending))
+                self.review_tasks[key] = review_task
+                try:
+                    day_reviews = await review_task
+                    if not self._is_pending_flow_active(pending):
+                        return
+                    pending.latest_suggestions = "\n\n".join(day_reviews)
+                    self._set_pending_program(pending)
+                    await self._send_day_reviews(message.channel, day_reviews, updated=True)
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    await send_discord_text(
+                        message.channel,
+                        "I noted that change request. Reply `save` when you're ready to import, or keep editing.",
+                    )
+                finally:
+                    if self.review_tasks.get(key) is review_task:
+                        self.review_tasks.pop(key, None)
+                return
 
-        if await self._handle_start_day_message(message.channel, content):
-            if context:
-                self._clear_programme_flow_state(user_id, channel_id)
-                await send_discord_text(
-                    message.channel,
-                    "Program saved and ready. Head to your workout channel and type `ready` to start.",
-                )
-            return
+            handled_start_day = await self._handle_start_day_message(
+                message.channel,
+                content,
+                program_id=int(context["program_id"]) if context else None,
+                allow_implicit=bool(context),
+                user_id=user_id,
+            )
+            if handled_start_day:
+                if context:
+                    self._clear_programme_flow_state(user_id, channel_id)
+                    await send_discord_text(
+                        message.channel,
+                        "Program saved and ready. Head to your workout channel and type `ready` to start.",
+                    )
+                return
 
-        if await self._handle_simple_edit_request(message.channel, content):
-            return
+            if await self._handle_simple_edit_request(message.channel, content):
+                return
 
-        await self._reply_programme_message(message.channel, content, user_id=user_id)
+            await self._reply_programme_message(message.channel, content, user_id=user_id)
 
 
 async def setup(bot: commands.Bot) -> None:

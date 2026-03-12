@@ -57,7 +57,24 @@ class PTBot(commands.Bot):
             "cogs.utility",
         ]:
             await self.load_extension(ext)
+        await self._clear_runtime_cog_state_if_fresh_db()
         logging.info("Loaded all cogs")
+
+    async def _clear_runtime_cog_state_if_fresh_db(self) -> None:
+        active = await self.db.get_active_program()
+        if active:
+            return
+        for cog_name in ("ProgrammeCog", "AskCog", "CheckInCog"):
+            cog = self.get_cog(cog_name)
+            if cog is None:
+                continue
+            clear_runtime = getattr(cog, "clear_runtime_state", None)
+            if callable(clear_runtime):
+                clear_runtime()
+                continue
+            memory = getattr(cog, "memory", None)
+            if memory and hasattr(memory, "clear_all"):
+                memory.clear_all()
 
     async def close(self) -> None:
         await self.ollama.close()
