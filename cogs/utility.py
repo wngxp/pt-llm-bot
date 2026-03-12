@@ -35,7 +35,7 @@ class UtilityCog(commands.Cog):
         await ctx.send(f"PT-LLM Bot v{BOT_VERSION}")
         await self._maybe_send_tip(ctx.channel)
 
-    @commands.command(name="help")
+    @commands.command(name="pthelp")
     async def help_command(self, ctx: commands.Context) -> None:
         lines = [
             "Core commands:",
