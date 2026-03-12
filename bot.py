@@ -9,6 +9,7 @@ from typing import Optional
 
 import discord
 from discord.ext import commands
+from aiohttp_socks import ProxyConnector
 
 from config import Settings, load_settings
 from db.database import Database
@@ -29,11 +30,13 @@ class PTBot(commands.Bot):
         intents.guilds = True
         intents.messages = True
 
+        connector = ProxyConnector.from_url("http://127.0.0.1:7890")
         super().__init__(
             command_prefix=settings.command_prefix,
             intents=intents,
-            help_command=None,
+            connector=connector,
         )
+        
         self.settings = settings
         self.db = Database(settings.database_path)
         self.ollama = OllamaClient(settings.ollama_base_url, settings.ollama_model)
@@ -76,7 +79,7 @@ class PTBot(commands.Bot):
             return None, None
         text = path.read_text(encoding="utf-8")
         match = re.search(
-            r"^## \\[(?P<version>[^\\]]+)\\] - (?P<date>[^\\n]+)\\n(?P<body>.*?)(?=^## \\[|\\Z)",
+            r"^## \[(?P<version>[^\]]+)\] - (?P<date>[^\n]+)\n(?P<body>.*?)(?=^## \[|\Z)",
             text,
             flags=re.MULTILINE | re.DOTALL,
         )
