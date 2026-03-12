@@ -77,7 +77,7 @@ class PTBot(commands.Bot):
             return None, None
         text = path.read_text(encoding="utf-8")
         match = re.search(
-            r"^## \\[(?P<version>[^\\]]+)\\] - (?P<date>[^\\n]+)\\n(?P<body>.*?)(?=^## \\[|\\Z)",
+            r"^## \[(?P<version>[^\]]+)\] - (?P<date>[^\n]+)\n(?P<body>.*?)(?=^## \[|\Z)",
             text,
             flags=re.MULTILINE | re.DOTALL,
         )
