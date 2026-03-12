@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -337,7 +336,30 @@ class Database:
                 """,
                 (exercise_name,),
             )
-        return dict(row) if row else None
+            if row:
+                return dict(row)
+
+            fallback = await self._fetchone(
+                conn,
+                """
+                SELECT
+                    e.name AS exercise_name,
+                    wl.weight AS weight,
+                    wl.reps AS reps,
+                    wl.unit AS unit,
+                    (wl.weight * (1 + wl.reps / 30.0)) AS estimated_1rm,
+                    wl.date AS date
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE LOWER(e.name) = LOWER(?)
+                ORDER BY estimated_1rm DESC, wl.date DESC
+                LIMIT 1
+                """,
+                (exercise_name,),
+            )
+            if fallback:
+                return dict(fallback)
+        return None
 
     async def create_pr(
         self,
@@ -504,6 +526,8 @@ class Database:
         return [dict(r) for r in rows]
 
     async def get_e1rm_history(self, exercise_name: str, limit: int = 12) -> list[dict[str, Any]]:
+        resolved = await self.resolve_exercise_name(exercise_name)
+        target = resolved or exercise_name
         async with self.connect() as conn:
             rows = await self._fetchall(conn, 
                 """
@@ -518,13 +542,18 @@ class Database:
                 ORDER BY wl.date ASC, wl.set_number ASC
                 LIMIT ?
                 """,
-                (exercise_name, limit),
+                (target, limit),
             )
         return [dict(r) for r in rows]
 
     async def export_logs(self, *, exercise_name: Optional[str] = None) -> list[dict[str, Any]]:
+        resolved_target: Optional[str] = None
+        if exercise_name:
+            resolved_target = await self.resolve_exercise_name(exercise_name)
+
         async with self.connect() as conn:
             if exercise_name:
+                target = resolved_target or exercise_name
                 rows = await self._fetchall(conn, 
                     """
                     SELECT wl.date,
@@ -541,7 +570,7 @@ class Database:
                     WHERE LOWER(e.name) = LOWER(?)
                     ORDER BY wl.date, e.name, wl.set_number
                     """,
-                    (exercise_name,),
+                    (target,),
                 )
             else:
                 rows = await self._fetchall(conn, 
@@ -560,6 +589,76 @@ class Database:
                     ORDER BY wl.date, e.name, wl.set_number
                     """
                 )
+        return [dict(r) for r in rows]
+
+    async def resolve_exercise_name(self, query: str) -> Optional[str]:
+        cleaned = query.strip()
+        if not cleaned:
+            return None
+
+        async with self.connect() as conn:
+            exact = await self._fetchone(
+                conn,
+                """
+                SELECT e.name AS name, COUNT(*) AS cnt
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE LOWER(e.name) = LOWER(?)
+                GROUP BY e.name
+                ORDER BY cnt DESC, LENGTH(e.name) ASC
+                LIMIT 1
+                """,
+                (cleaned,),
+            )
+            if exact:
+                return str(exact["name"])
+
+            like = f"%{cleaned.lower()}%"
+            partial = await self._fetchone(
+                conn,
+                """
+                SELECT e.name AS name, COUNT(*) AS cnt
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE LOWER(e.name) LIKE ?
+                GROUP BY e.name
+                ORDER BY cnt DESC, LENGTH(e.name) ASC
+                LIMIT 1
+                """,
+                (like,),
+            )
+            if partial:
+                return str(partial["name"])
+
+            program_partial = await self._fetchone(
+                conn,
+                """
+                SELECT e.name AS name
+                FROM exercises e
+                WHERE LOWER(e.name) LIKE ?
+                ORDER BY LENGTH(e.name) ASC
+                LIMIT 1
+                """,
+                (like,),
+            )
+            if program_partial:
+                return str(program_partial["name"])
+        return None
+
+    async def get_recent_activities(self, hours: int = 72) -> list[dict[str, Any]]:
+        days = max(1, int(hours / 24))
+        threshold = (date.today() - timedelta(days=days)).isoformat()
+        async with self.connect() as conn:
+            rows = await self._fetchall(
+                conn,
+                """
+                SELECT *
+                FROM activity_logs
+                WHERE date >= ?
+                ORDER BY date DESC, id DESC
+                """,
+                (threshold,),
+            )
         return [dict(r) for r in rows]
 
     async def mark_workout_completed(self, workout_date: date) -> dict[str, int]:

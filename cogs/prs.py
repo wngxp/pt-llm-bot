@@ -6,6 +6,8 @@ from typing import Any, Optional
 import discord
 from discord.ext import commands
 
+from utils.numbers import format_standard_number
+
 
 class PRsCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
@@ -34,15 +36,18 @@ class PRsCog(commands.Cog):
         previous = payload.get("previous")
         lines = [
             f"🏆 New {payload['exercise_name']} PR!",
-            f"{payload['weight']:g} {payload['unit']} x {payload['reps']} (estimated 1RM: {payload['e1rm']:.1f})",
+            (
+                f"{format_standard_number(float(payload['weight']))} {payload['unit']} x {payload['reps']} "
+                f"(estimated 1RM: {format_standard_number(float(payload['e1rm']))})"
+            ),
         ]
         if previous:
             prev_e1rm = float(previous["estimated_1rm"])
             gain = payload["e1rm"] - prev_e1rm
             pct = (gain / prev_e1rm * 100.0) if prev_e1rm > 0 else 0
             lines.append(
-                f"Previous: {previous['weight']:g}{previous['unit']} x {previous['reps']} "
-                f"(e1RM {prev_e1rm:.1f})"
+                f"Previous: {format_standard_number(float(previous['weight']))}{previous['unit']} x {previous['reps']} "
+                f"(e1RM {format_standard_number(prev_e1rm)})"
             )
             lines.append(f"Improvement: {gain:+.1f} ({pct:+.1f}%)")
 
@@ -58,8 +63,9 @@ class PRsCog(commands.Cog):
         lines = [f"Recent PRs ({days}d):"]
         for row in rows[:15]:
             lines.append(
-                f"{row['date']}: {row['exercise_name']} {row['weight']:g}{row['unit']} x {row['reps']} "
-                f"(e1RM {row['estimated_1rm']:.1f})"
+                f"{row['date']}: {row['exercise_name']} "
+                f"{format_standard_number(float(row['weight']))}{row['unit']} x {row['reps']} "
+                f"(e1RM {format_standard_number(float(row['estimated_1rm']))})"
             )
         await ctx.send("\n".join(lines))
 

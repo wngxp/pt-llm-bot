@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from utils.numbers import format_standard_number
+
 
 def generate_warmup(working_weight: float, category: str, unit: str = "lbs") -> Optional[list[str]]:
     bar = 45 if unit == "lbs" else 20
@@ -18,7 +20,7 @@ def generate_warmup(working_weight: float, category: str, unit: str = "lbs") -> 
         for pct, rep in ((0.4, 8), (0.6, 5), (0.75, 3), (0.9, 1)):
             w = rnd(working_weight * pct)
             if w > bar:
-                sets.append(f"{w:g} x {rep}")
+                sets.append(f"{format_standard_number(w)} x {rep}")
         return sets
 
     if category == "light_barbell":
@@ -26,7 +28,7 @@ def generate_warmup(working_weight: float, category: str, unit: str = "lbs") -> 
         for pct, rep in ((0.5, 6), (0.75, 3)):
             w = rnd(working_weight * pct)
             if w > bar:
-                sets.append(f"{w:g} x {rep}")
+                sets.append(f"{format_standard_number(w)} x {rep}")
         return sets
 
     if category == "dumbbell":
@@ -34,12 +36,12 @@ def generate_warmup(working_weight: float, category: str, unit: str = "lbs") -> 
         for pct, rep in ((0.5, 8), (0.75, 5)):
             w = rnd(working_weight * pct)
             if w > 0:
-                sets.append(f"{w:g} x {rep}")
+                sets.append(f"{format_standard_number(w)} x {rep}")
         return sets or None
 
     if category == "cable_machine":
         w = rnd(working_weight * 0.5)
-        return [f"{w:g} x 10"] if w > 0 else None
+        return [f"{format_standard_number(w)} x 10"] if w > 0 else None
 
     if category == "bodyweight":
         return ["1-2 easy ramp sets"]

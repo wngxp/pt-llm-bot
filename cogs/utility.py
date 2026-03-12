@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 
 
-BOT_VERSION = "0.2.2"
+BOT_VERSION = "0.2.3"
 
 
 class UtilityCog(commands.Cog):
@@ -39,15 +39,12 @@ class UtilityCog(commands.Cog):
     async def help_command(self, ctx: commands.Context) -> None:
         lines = [
             "Core commands:",
-            "- !start / ready",
-            "- !done",
+            "- Workout-only: `ready`, `skip rest`, set logs like `225 x 3`",
+            "- Utility (global): `!timezone`, `!volume`, `!e1rm`, `!export`, `!cue`, `!plates`, `!help`",
+            "- `!start` / `!done` in workout channels",
             "- !plates <weight> [lbs|kg]",
-            "- !volume",
             "- !e1rm <exercise>",
-            "- !export [exercise]",
-            "- !cue <exercise> <text>",
-            "- !timezone [IANA timezone]",
-            "- !checkin",
+            "- !checkin / !summary in #check-in",
             "- !version",
         ]
         await ctx.send("\n".join(lines))

@@ -97,16 +97,16 @@ python3 bot.py
 - `!startday <day name or day number>`
 - `!travel <description and optional duration>`
 - `!start`, `!done` (workout channels)
-- `!plates <weight> [lbs|kg]`
-- `!e1rm <exercise>`
-- `!volume`
-- `!cue <exercise> <cue text>`
-- `!export [exercise]`
+- `!plates <weight> [lbs|kg]` (global; unit optional)
+- `!e1rm <exercise>` (global; case-insensitive partial match supported)
+- `!volume` (global)
+- `!cue <exercise> <cue text>` (global)
+- `!export [exercise]` (global)
 - `!activity <description>`
 - `!readiness <1-10>`
 - `!phase <cut|bulk|maintain>`
-- `!timezone [IANA tz name]` (example: `America/New_York`)
-- `!checkin`
+- `!timezone [IANA tz name]` (global, example: `America/New_York`)
+- `!checkin`, `!summary` (check-in channel)
 - `!ask <question>`
 - `!prs [days]`
 - `!help`, `!version`
@@ -116,3 +116,4 @@ python3 bot.py
 - Program parsing and coaching rely on Ollama availability.
 - Core logging math (progression, e1RM, warm-up, plates) runs without LLM.
 - The database is initialized automatically on startup.
+- Utility commands work in any channel; workout interactions (`ready`, set logging, `skip rest`) stay restricted to workout channels.

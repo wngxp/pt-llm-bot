@@ -10,13 +10,15 @@ import discord
 from discord.ext import commands
 
 from llm.parser import ProgramParser
+from llm.prompts import FITNESS_ONLY_GUARDRAIL
+from utils.conversation_memory import ConversationMemory
+from utils.discord_messages import send_discord_text
 
 
 DURATION_RE = re.compile(r"(?P<num>\d+)\s*(?P<unit>day|days|week|weeks)", re.IGNORECASE)
 DAY_NUMBER_RE = re.compile(r"\bday\s*(?P<day_num>\d+)\b", re.IGNORECASE)
 START_DAY_INTENT_RE = re.compile(r"\b(start|begin|starting|start on|begin with)\b", re.IGNORECASE)
 EDIT_INTENT_RE = re.compile(r"\b(edit|swap|replace|change|modify)\b", re.IGNORECASE)
-QUESTION_HINT_RE = re.compile(r"\?|\b(what|why|how|can|should|which)\b", re.IGNORECASE)
 SET_PATTERN_RE = re.compile(r"\d+\s*[xX×]\s*\d+")
 
 
@@ -27,12 +29,13 @@ class ProgrammeCog(commands.Cog):
         self.db = bot.db
         self.parser = ProgramParser(bot.ollama)
         self.post_import_state: dict[int, dict[str, Any]] = {}
+        self.memory = ConversationMemory(max_messages=10, ttl_minutes=30)
 
     def _is_programme_channel(self, channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel) -> bool:
         cid = getattr(channel, "id", None)
         name = getattr(channel, "name", "")
         if self.settings.programme_channel_id:
-            return cid == self.settings.programme_channel_id
+            return cid == self.settings.programme_channel_id or name == "programme"
         return name == "programme"
 
     def _is_placeholder_name(self, name: str) -> bool:
@@ -101,7 +104,7 @@ class ProgrammeCog(commands.Cog):
         if inferred:
             return inferred
 
-        await channel.send("What would you like to name this program?")
+        await send_discord_text(channel, "What would you like to name this program?")
         try:
             reply = await self.bot.wait_for(
                 "message",
@@ -123,7 +126,7 @@ class ProgrammeCog(commands.Cog):
         for day in days:
             lines.append(f"{day['day_order'] + 1}. {day['name']}")
         lines.append("Reply with `start on Legs` or `start on Day 3`.")
-        await channel.send("\n".join(lines))
+        await send_discord_text(channel, "\n".join(lines))
 
     async def _import_program(
         self,
@@ -142,9 +145,10 @@ class ProgrammeCog(commands.Cog):
 
         days = parsed.get("days", [])
         total_exercises = sum(len(day.get("exercises", [])) for day in days)
-        await channel.send(
+        await send_discord_text(
+            channel,
             f"✅ Imported **{parsed['program_name']}** (ID {program_id}) with "
-            f"{len(days)} days and {total_exercises} exercises."
+            f"{len(days)} days and {total_exercises} exercises.",
         )
         self._set_post_import_context(author.id, getattr(channel, "id", 0), program_id)
         await self._start_day_prompt(channel, program_id)
@@ -191,13 +195,14 @@ class ProgrammeCog(commands.Cog):
             lines = ["I couldn't map that to a program day. Try one of:"]
             for day in days:
                 lines.append(f"{day['day_order'] + 1}. {day['name']}")
-            await channel.send("\n".join(lines))
+            await send_discord_text(channel, "\n".join(lines))
             return True
 
         await self.db.set_current_day_index(idx)
         selected = next((d for d in days if int(d["day_order"]) == idx), days[idx])
-        await channel.send(
-            f"✅ Starting day set to **{selected['name']}** (Day {idx + 1} of {len(days)})."
+        await send_discord_text(
+            channel,
+            f"✅ Starting day set to **{selected['name']}** (Day {idx + 1} of {len(days)}).",
         )
         return True
 
@@ -210,9 +215,9 @@ class ProgrammeCog(commands.Cog):
             new_name = swap_match.group(2).strip(" .")
             rows = await self.db.update_exercise_name_in_active_program(old_name, new_name)
             if rows > 0:
-                await channel.send(f"✅ Updated exercise: **{old_name}** -> **{new_name}**.")
+                await send_discord_text(channel, f"✅ Updated exercise: **{old_name}** -> **{new_name}**.")
             else:
-                await channel.send(f"Couldn't find `{old_name}` in the active program.")
+                await send_discord_text(channel, f"Couldn't find `{old_name}` in the active program.")
             return True
 
         change_match = re.search(r"change\s+(.+?)\s+to\s+(.+)$", text, re.IGNORECASE)
@@ -222,62 +227,86 @@ class ProgrammeCog(commands.Cog):
 
             day_rows = await self.db.rename_program_day_in_active_program(old_name, new_name)
             if day_rows > 0:
-                await channel.send(f"✅ Renamed day: **{old_name}** -> **{new_name}**.")
+                await send_discord_text(channel, f"✅ Renamed day: **{old_name}** -> **{new_name}**.")
                 return True
 
             ex_rows = await self.db.update_exercise_name_in_active_program(old_name, new_name)
             if ex_rows > 0:
-                await channel.send(f"✅ Renamed exercise: **{old_name}** -> **{new_name}**.")
+                await send_discord_text(channel, f"✅ Renamed exercise: **{old_name}** -> **{new_name}**.")
             else:
-                await channel.send(
-                    "I couldn't apply that change directly. Try `swap <old exercise> with <new exercise>`."
+                await send_discord_text(
+                    channel,
+                    "I couldn't apply that change directly. Try `swap <old exercise> with <new exercise>`.",
                 )
             return True
 
         if EDIT_INTENT_RE.search(lowered):
             active = await self.db.get_active_program()
             if not active:
-                await channel.send("No active program to edit yet.")
+                await send_discord_text(channel, "No active program to edit yet.")
                 return True
             days = await self.db.get_program_days(int(active["id"]))
             context = {"program": active, "days": days, "request": text}
             try:
                 reply = await self.bot.ollama.chat(
                     system=(
+                        f"{FITNESS_ONLY_GUARDRAIL}\n"
                         "You are assisting with workout program edits. "
                         "Give a concise response and suggest a concrete edit command. Keep it under 3 sentences."
                     ),
                     user=json.dumps(context, ensure_ascii=False),
                     temperature=0.2,
+                    max_tokens=180,
                 )
-                await channel.send(reply.strip())
+                await send_discord_text(channel, reply.strip())
             except Exception:
-                await channel.send("I couldn't process that edit request right now. Try `swap X with Y`.")
+                await send_discord_text(channel, "I couldn't process that edit request right now. Try `swap X with Y`.")
             return True
 
         return False
 
-    async def _reply_programme_question(self, channel: discord.abc.Messageable, text: str) -> None:
+    async def _reply_programme_message(
+        self,
+        channel: discord.abc.Messageable,
+        text: str,
+        *,
+        user_id: int,
+    ) -> None:
         active = await self.db.get_active_program()
         if not active:
-            await channel.send("No active program yet. Paste one to get started.")
+            await send_discord_text(channel, "No active program yet. Paste one to get started.")
             return
+
         days = await self.db.get_program_days(int(active["id"]))
+        history = self.memory.get(user_id=user_id, channel_id=getattr(channel, "id", 0))
         payload = {
-            "question": text,
+            "message": text,
             "program": active,
             "days": days,
+            "history": history,
             "response_style": "2-3 short sentences.",
         }
         try:
             reply = await self.bot.ollama.chat(
-                system="You help users discuss and understand their lifting program. Keep answers concise.",
+                system=(
+                    f"{FITNESS_ONLY_GUARDRAIL}\n"
+                    "You help users discuss and update their lifting program. "
+                    "Always answer concisely in 2-3 short sentences."
+                ),
                 user=json.dumps(payload, ensure_ascii=False),
                 temperature=0.2,
+                max_tokens=200,
             )
-            await channel.send(reply.strip())
+            reply_text = reply.strip()
+            self.memory.append(
+                user_id=user_id,
+                channel_id=getattr(channel, "id", 0),
+                role="assistant",
+                content=reply_text,
+            )
+            await send_discord_text(channel, reply_text)
         except Exception:
-            await channel.send("I couldn't answer that right now. Try `!program` to view the current setup.")
+            await send_discord_text(channel, "I couldn't answer that right now. Try `!program` to view the current setup.")
 
     @commands.command(name="import")
     async def import_program_command(self, ctx: commands.Context, *, text: str) -> None:
@@ -300,7 +329,7 @@ class ProgrammeCog(commands.Cog):
         for day in days:
             exercises = await self.db.get_exercises_for_day(day["id"])
             lines.append(f"Day {day['day_order'] + 1}: {day['name']} ({len(exercises)} exercises)")
-        await ctx.send("\n".join(lines))
+        await send_discord_text(ctx.channel, "\n".join(lines))
 
     @commands.command(name="startday")
     async def start_day_command(self, ctx: commands.Context, *, text: str) -> None:
@@ -308,7 +337,7 @@ class ProgrammeCog(commands.Cog):
             return
         handled = await self._handle_start_day_message(ctx.channel, f"start on {text}")
         if not handled:
-            await ctx.send("Couldn't parse that day selection. Try `!startday Day 3` or `!startday Legs`.")
+            await send_discord_text(ctx.channel, "Couldn't parse that day selection. Try `!startday Day 3` or `!startday Legs`.")
 
     @commands.command(name="travel")
     async def travel_program_command(self, ctx: commands.Context, *, text: str) -> None:
@@ -317,7 +346,7 @@ class ProgrammeCog(commands.Cog):
 
         active = await self.db.get_active_program()
         if not active:
-            await ctx.send("You need an active base program first.")
+            await send_discord_text(ctx.channel, "You need an active base program first.")
             return
 
         duration_days = 14
@@ -336,7 +365,7 @@ class ProgrammeCog(commands.Cog):
             f"Context: {text}. Keep 3-5 days cycle and use available equipment."
         )
         parsed = await self.bot.ollama.chat_json(
-            system="Return only valid JSON workout program.",
+            system=f"{FITNESS_ONLY_GUARDRAIL}\nReturn only valid JSON workout program.",
             user=prompt,
             temperature=0.2,
         )
@@ -347,9 +376,10 @@ class ProgrammeCog(commands.Cog):
             parent_program_id=active["id"],
             expires_at=expires,
         )
-        await ctx.send(
+        await send_discord_text(
+            ctx.channel,
             f"✅ Temporary program activated (ID {program_id}) until {expires}. "
-            f"Base program: **{active['name']}** will resume automatically."
+            f"Base program: **{active['name']}** will resume automatically.",
         )
         self._set_post_import_context(ctx.author.id, ctx.channel.id, int(program_id))
 
@@ -361,20 +391,19 @@ class ProgrammeCog(commands.Cog):
             return
 
         content = message.content.strip()
-        if not content:
-            return
-        if content.startswith(self.settings.command_prefix):
+        if not content or content.startswith(self.settings.command_prefix):
             return
 
         user_id = message.author.id
         channel_id = message.channel.id
         context = self._get_post_import_context(user_id, channel_id)
+        self.memory.append(user_id=user_id, channel_id=channel_id, role="user", content=content)
 
         if self._looks_like_program_paste(content):
             try:
                 await self._import_program(message.channel, message.author, content)
             except Exception as exc:
-                await message.channel.send(f"Could not parse program: {exc}")
+                await send_discord_text(message.channel, f"Could not parse program: {exc}")
             return
 
         if await self._handle_start_day_message(message.channel, content):
@@ -385,14 +414,7 @@ class ProgrammeCog(commands.Cog):
         if await self._handle_simple_edit_request(message.channel, content):
             return
 
-        if context or QUESTION_HINT_RE.search(content) or "program" in content.lower():
-            await self._reply_programme_question(message.channel, content)
-            return
-
-        if context:
-            await message.channel.send(
-                "You can say `start on Legs`, `start on Day 3`, or request an edit like `swap RDL with Good Morning`."
-            )
+        await self._reply_programme_message(message.channel, content, user_id=user_id)
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -9,7 +10,10 @@ import discord
 from discord.ext import commands, tasks
 
 from llm.prompts import CHECKIN_SYSTEM_PROMPT
+from utils.discord_messages import send_discord_text
 from utils.volume import format_volume_report
+
+logger = logging.getLogger(__name__)
 
 READINESS_RULES: list[tuple[set[str], int, str]] = [
     ({"bad sleep", "no sleep", "havent been sleeping", "haven't been sleeping", "poor sleep"}, -2, "sleep issues"),
@@ -24,6 +28,7 @@ class CheckInCog(commands.Cog):
         self.bot = bot
         self.settings = bot.settings
         self.db = bot.db
+        self._warned_checkin_channel = False
         self.weekly_check_loop.start()
 
     def cog_unload(self) -> None:
@@ -33,7 +38,7 @@ class CheckInCog(commands.Cog):
         cid = getattr(channel, "id", None)
         name = getattr(channel, "name", "")
         if self.settings.checkin_channel_id:
-            return cid == self.settings.checkin_channel_id
+            return cid == self.settings.checkin_channel_id or name == "check-in"
         return name == "check-in"
 
     async def _generate_summary(self) -> str:
@@ -45,6 +50,7 @@ class CheckInCog(commands.Cog):
         prs = await self.db.get_recent_prs(7)
         weekly_volume = await self.db.get_weekly_volume(start_date=week_start)
         trend = await self.db.get_trend_last_4_weeks()
+        context = await self.db.build_context(target_date=today)
 
         sessions_count = 0
         latest_workout = await self.db.get_latest_workout_date()
@@ -66,24 +72,28 @@ class CheckInCog(commands.Cog):
             local_lines.append("")
             local_lines.append("Top trends:")
             for row in trend[:3]:
-                local_lines.append(
-                    f"- {row['exercise_name']}: best e1RM {row['best_e1rm']:.1f}"
-                )
+                local_lines.append(f"- {row['exercise_name']}: best e1RM {row['best_e1rm']:.1f}")
 
-        context: dict[str, Any] = {
+        llm_payload: dict[str, Any] = {
             "window": [week_start.isoformat(), week_end.isoformat()],
             "state": state,
             "prs": prs,
             "weekly_volume": weekly_volume,
             "trend": trend,
             "sessions_count": sessions_count,
+            "context": {
+                "todays_exercises": context.get("todays_exercises", []),
+                "recent_activities": context.get("recent_activities", []),
+                "recent_performance_trend": context.get("recent_performance_trend", []),
+            },
         }
 
         try:
             llm = await self.bot.ollama.chat(
                 system=CHECKIN_SYSTEM_PROMPT,
-                user=json.dumps(context, ensure_ascii=False),
+                user=json.dumps(llm_payload, ensure_ascii=False),
                 temperature=0.2,
+                max_tokens=250,
             )
             return llm.strip()
         except Exception:
@@ -103,21 +113,25 @@ class CheckInCog(commands.Cog):
         return None
 
     async def _reply_short_checkin_chat(self, text: str) -> str:
-        state = await self.db.get_user_state()
+        context = await self.db.build_context(target_date=date.today())
         prompt = {
             "message": text,
             "response_style": "Reply in 2-3 short sentences.",
             "state": {
-                "phase": state.get("phase"),
-                "readiness": state.get("readiness"),
-                "current_streak": state.get("current_streak"),
+                "phase": context["user_state"].get("phase"),
+                "readiness": context["user_state"].get("readiness"),
+                "current_streak": context["user_state"].get("current_streak"),
             },
+            "recent_activities": context.get("recent_activities", [])[:8],
+            "weekly_volume": context.get("weekly_volume"),
+            "recent_logs": context.get("last_session_logs", [])[:15],
         }
         try:
             reply = await self.bot.ollama.chat(
                 system=CHECKIN_SYSTEM_PROMPT,
                 user=json.dumps(prompt, ensure_ascii=False),
                 temperature=0.2,
+                max_tokens=180,
             )
         except Exception:
             return "Got it. I logged that check-in context and will adjust suggestions accordingly."
@@ -132,13 +146,27 @@ class CheckInCog(commands.Cog):
             return
         summary = await self._generate_summary()
         await self.db.set_last_checkin(date.today())
-        await ctx.send(summary)
+        await send_discord_text(ctx.channel, summary)
+
+    @commands.command(name="summary")
+    async def summary_command(self, ctx: commands.Context) -> None:
+        if not self._is_checkin_channel(ctx.channel):
+            return
+        summary = await self._generate_summary()
+        await self.db.set_last_checkin(date.today())
+        await send_discord_text(ctx.channel, summary)
 
     async def _get_checkin_channel(self) -> Optional[discord.TextChannel]:
         if self.settings.checkin_channel_id:
             channel = self.bot.get_channel(self.settings.checkin_channel_id)
             if isinstance(channel, discord.TextChannel):
                 return channel
+            if not self._warned_checkin_channel:
+                logger.warning(
+                    "CHECKIN_CHANNEL_ID=%s not found at runtime; falling back to #check-in name lookup",
+                    self.settings.checkin_channel_id,
+                )
+                self._warned_checkin_channel = True
 
         for guild in self.bot.guilds:
             for channel in guild.text_channels:
@@ -164,8 +192,9 @@ class CheckInCog(commands.Cog):
             return
 
         summary = await self._generate_summary()
-        await channel.send(
-            "You haven’t checked in yet this week. Here’s your proactive summary:\n\n" + summary
+        await send_discord_text(
+            channel,
+            "You haven't checked in yet this week. Here's your proactive summary:\n\n" + summary,
         )
         await self.db.set_last_checkin(date.today())
 
@@ -183,8 +212,9 @@ class CheckInCog(commands.Cog):
         readiness_update = await self._adjust_readiness_from_text(content)
         if readiness_update:
             score, reason = readiness_update
-            await message.channel.send(
-                f"Got it - I adjusted readiness to {score}/10 based on {reason}. I'll adapt today's suggestions."
+            await send_discord_text(
+                message.channel,
+                f"Got it - I adjusted readiness to {score}/10 based on {reason}. I'll adapt today's suggestions.",
             )
             return
 
@@ -192,11 +222,11 @@ class CheckInCog(commands.Cog):
         if any(token in lowered for token in {"summary", "weekly", "check in", "check-in"}):
             summary = await self._generate_summary()
             await self.db.set_last_checkin(date.today())
-            await message.channel.send(summary)
+            await send_discord_text(message.channel, summary)
             return
 
         reply = await self._reply_short_checkin_chat(content)
-        await message.channel.send(reply)
+        await send_discord_text(message.channel, reply)
 
 
 async def setup(bot: commands.Bot) -> None:

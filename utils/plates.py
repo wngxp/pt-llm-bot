@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from utils.numbers import format_standard_number
+
 
 def plates_breakdown(total_weight: float, unit: str = "lbs") -> str:
     bar = 45 if unit == "lbs" else 20
     if total_weight <= bar:
-        return "just the bar"
+        return f"{format_standard_number(total_weight)} {unit} = just the bar ({bar})"
 
     per_side = (total_weight - bar) / 2
     plates = [45, 25, 10, 5, 2.5] if unit == "lbs" else [20, 10, 5, 2.5, 1.25]
@@ -18,12 +20,15 @@ def plates_breakdown(total_weight: float, unit: str = "lbs") -> str:
             remaining -= count * plate
 
     if unit == "lbs" and result == [(2, 45)]:
-        return "2 plates per side"
+        return f"{format_standard_number(total_weight)} lbs = bar (45) + 2x45 per side"
     if unit == "lbs" and result == [(1, 45)]:
-        return "1 plate per side"
+        return f"{format_standard_number(total_weight)} lbs = bar (45) + 1x45 per side"
 
     if not result:
-        return "micro plates needed"
+        return f"{format_standard_number(total_weight)} {unit} = micro plates needed"
 
-    parts = [f"{count}x{weight:g}" for count, weight in result]
-    return " + ".join(parts) + " per side"
+    parts = [f"{count}x{format_standard_number(weight)}" for count, weight in result]
+    return (
+        f"{format_standard_number(total_weight)} {unit} = "
+        f"bar ({bar}) + {' + '.join(parts)} per side"
+    )

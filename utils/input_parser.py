@@ -4,16 +4,16 @@ import re
 from typing import Any, Optional
 
 PREFIX_PATTERN = re.compile(
-    r"^(?:i\s+hit|just\s+did|i\s+did|did|got)\s+",
+    r"^(?:i\s+hit|just\s+did|i\s+did|did|got|i\s+got)\s+",
     re.IGNORECASE,
 )
 
 SET_SEARCH_PATTERN = re.compile(
     r"""
     (?P<weight_token>
-        bodyweight(?:\s*[+-]\s*\d+(?:\.\d+)?)?
+        bodyweight(?:\s*[+-]\s*\d+(?:\.\d+)?(?:\s*(?:kg|kgs|lb|lbs))?)?
         |
-        bw(?:\s*[+-]\s*\d+(?:\.\d+)?)?
+        bw(?:\s*[+-]\s*\d+(?:\.\d+)?(?:\s*(?:kg|kgs|lb|lbs))?)?
         |
         \d+(?:\.\d+)?
     )
@@ -36,7 +36,7 @@ RIR_ANY_PATTERN = re.compile(
 )
 
 BW_TOKEN_PATTERN = re.compile(
-    r"^(?P<base>bw|bodyweight)(?:(?P<op>[+-])(?P<offset>\d+(?:\.\d+)?))?$",
+    r"^(?P<base>bw|bodyweight)(?:(?P<op>[+-])(?P<offset>\d+(?:\.\d+)?)(?P<offset_unit>kg|kgs|lb|lbs)?)?$",
     re.IGNORECASE,
 )
 
@@ -72,6 +72,7 @@ def normalize_unit(unit: Optional[str], fallback: str = "lbs") -> str:
 
 def _normalize_text(text: str) -> str:
     cleaned = text.strip()
+    cleaned = cleaned.replace(",", "")
     cleaned = PREFIX_PATTERN.sub("", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\bbody\s+weight\b", "bodyweight", cleaned, flags=re.IGNORECASE)
@@ -90,10 +91,21 @@ def _parse_weight_token(token: str) -> tuple[float, bool, str]:
     if not op or not offset:
         return 0.0, True, "bodyweight"
 
-    offset_value = float(offset)
+    offset_value = float(offset.rstrip("kgslb"))
     sign = "+" if op == "+" else "-"
     clean_offset = int(offset_value) if offset_value.is_integer() else offset_value
-    return 0.0, True, f"bw{sign}{clean_offset}"
+    if sign == "+":
+        return float(offset_value), True, f"bw+{clean_offset}"
+    return 0.0, True, f"bw-{clean_offset}"
+
+
+def _extract_inline_unit_from_weight_token(token: str) -> Optional[str]:
+    lowered = token.strip().lower().replace(" ", "")
+    if lowered.endswith(("kg", "kgs")):
+        return "kg"
+    if lowered.endswith(("lb", "lbs")):
+        return "lbs"
+    return None
 
 
 def _extract_exercise_candidate(prefix_text: str) -> tuple[Optional[str], str]:
@@ -134,6 +146,9 @@ def parse_set_input(text: str) -> Optional[dict[str, Any]]:
     weight, is_bodyweight, bw_note = _parse_weight_token(match.group("weight_token"))
     reps = int(match.group("reps"))
     unit_raw = match.group("unit")
+    inline_unit = _extract_inline_unit_from_weight_token(match.group("weight_token"))
+    if not unit_raw and inline_unit:
+        unit_raw = inline_unit
 
     tail_parts = [part for part in [leftover_prefix, after] if part]
     trailing_text = " ".join(tail_parts).strip()

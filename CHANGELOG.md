@@ -40,3 +40,32 @@
 - Post-import `#programme` context window (~5 minutes) for follow-up commands like `start on Legs`
 - Dedicated utility command support with `SETTINGS_CHANNEL_ID` and tips when commands are run outside `#settings`
 - `!help`, `!version`, and `!startday` commands
+
+## [0.2.3] - 2026-03-12
+### Fixed
+- Added anti-injection guardrails as the first line in all core LLM system prompts and guarded programme-edit/travel prompts
+- `#ask` is now concise (2-3 sentences, `max_tokens=150`) and only responds to mentions, questions, or replies to the bot
+- `#ask` and `#programme` now keep short per-user per-channel conversation memory (TTL 30 minutes)
+- `#programme` now handles follow-up conversation reliably instead of dropping non-import messages
+- Added safe Discord message splitting to avoid 4000-character API errors on long LLM output
+- Workout set logging now rejects unrealistic inputs (`>1500 lbs` / `>700 kg` / `>200 reps`)
+- Input parser now strips commas (`10,000 x 10`) and extracts set patterns while preserving trailing notes
+- Bodyweight entries are now blocked for non-bodyweight exercises with a clear correction message
+- `bw+N` bodyweight logging now stores `weight=N` for proper e1RM/PR calculations; plain `bw` remains baseline with no e1RM
+- `!plates` now works globally and defaults to the user’s configured unit when unit is omitted
+- `!e1rm` now supports case-insensitive and partial matching through canonical exercise resolution
+- CSV export now rounds numeric fields to 1 decimal place and filters unrealistic outlier weights
+- Early-exit flow no longer repeats motivational text, and `move on` now confirms the exact next day
+- Workout suggestions now account for overlapping high-intensity activities in the last 72h (10% suggestion reduction)
+- PR checks now include debug tracing and fallback comparison against workout history when PR table baseline is missing
+- Program parser now sends required exercise constraints to the LLM, validates against extracted names, and aggressively repairs/falls back on mismatch
+- Added parser regression test to ensure `Pause Squat` stays distinct from `Squat` with the correct `2x5` scheme
+- `#check-in` now has stronger channel-ID fallback handling, conversational replies with richer context, and explicit `!summary`
+
+### Added
+- New utilities: `utils/discord_messages.py`, `utils/conversation_memory.py`, `utils/numbers.py`
+- New parser regression test: `tests/test_program_parser.py`
+
+### Docs
+- Documented that utility commands (`!timezone`, `!volume`, `!e1rm`, `!export`, `!cue`, `!plates`, `!help`) are global
+- Clarified that workout interactions remain restricted to workout day channels

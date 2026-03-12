@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 import re
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
-from llm.client import OllamaClient
 from llm.prompts import PROGRAM_PARSER_SYSTEM_PROMPT
+
+if TYPE_CHECKING:
+    from llm.client import OllamaClient
 
 
 REP_RANGE_RE = re.compile(r"(?P<sets>\d+)\s*[xX×]\s*(?P<low>\d+)(?:\s*[-–]\s*(?P<high>\d+))?")
@@ -28,31 +31,71 @@ VALID_CATEGORIES = {"heavy_barbell", "light_barbell", "dumbbell", "cable_machine
 
 
 class ProgramParser:
-    def __init__(self, client: OllamaClient) -> None:
+    def __init__(self, client: "OllamaClient") -> None:
         self.client = client
 
     async def parse_program(self, raw_program_text: str) -> dict[str, Any]:
         if not raw_program_text.strip():
             raise ValueError("Program text is empty")
 
+        day_blocks = self._extract_day_blocks(raw_program_text)
+        required_exercises = self._extract_required_exercise_constraints(day_blocks)
+        required_lines = self._extract_required_exercise_lines(day_blocks)
+        llm_input = {
+            "raw_program_text": raw_program_text,
+            "required_exercises": required_exercises,
+            "required_exercise_lines": required_lines,
+            "required_day_count": len(day_blocks),
+        }
+
         try:
             payload = await self.client.chat_json(
                 system=PROGRAM_PARSER_SYSTEM_PROMPT,
-                user=raw_program_text,
+                user=json.dumps(llm_input, ensure_ascii=False),
                 temperature=0.0,
             )
             normalized = self._normalize_program(payload)
-            return self._post_process_program(normalized, raw_program_text)
+            parsed = self._post_process_program(
+                normalized,
+                raw_program_text,
+                extracted_day_blocks=day_blocks,
+                required_exercises=required_exercises,
+            )
+            if self._violates_required_constraints(parsed, required_exercises):
+                fallback = self._fallback_parse(raw_program_text)
+                normalized = self._normalize_program(fallback)
+                parsed = self._post_process_program(
+                    normalized,
+                    raw_program_text,
+                    extracted_day_blocks=day_blocks,
+                    required_exercises=required_exercises,
+                )
+            return parsed
         except Exception:
             fallback = self._fallback_parse(raw_program_text)
             normalized = self._normalize_program(fallback)
-            return self._post_process_program(normalized, raw_program_text)
+            return self._post_process_program(
+                normalized,
+                raw_program_text,
+                extracted_day_blocks=day_blocks,
+                required_exercises=required_exercises,
+            )
 
-    def _post_process_program(self, parsed: dict[str, Any], raw_text: str) -> dict[str, Any]:
-        day_blocks = self._extract_day_blocks(raw_text)
+    def _post_process_program(
+        self,
+        parsed: dict[str, Any],
+        raw_text: str,
+        *,
+        extracted_day_blocks: Optional[list[dict[str, Any]]] = None,
+        required_exercises: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        day_blocks = extracted_day_blocks if extracted_day_blocks is not None else self._extract_day_blocks(raw_text)
         if day_blocks:
             parsed = self._rebuild_from_day_blocks(parsed, day_blocks)
             parsed = self._repair_duplicate_names_from_raw(parsed, day_blocks)
+
+        if required_exercises:
+            parsed = self._repair_missing_required_exercises(parsed, required_exercises)
 
         for day in parsed["days"]:
             for ex in day["exercises"]:
@@ -60,11 +103,133 @@ class ProgramParser:
                 self._flag_or_repair_rep_ranges(ex, raw_text)
             self._flag_suspicious_adjacent_duplicates(day)
 
+        header_count = self._count_day_headers(raw_text)
+        if header_count > 0 and len(parsed["days"]) != header_count:
+            parsed = self._align_day_count_with_headers(parsed, day_blocks, header_count)
+
         parsed["days"].sort(key=lambda d: d["day_order"])
         for idx, day in enumerate(parsed["days"]):
             day["day_order"] = idx
             for ex_idx, ex in enumerate(day["exercises"]):
                 ex["display_order"] = ex_idx
+        return parsed
+
+    def _extract_required_exercise_constraints(self, blocks: list[dict[str, Any]]) -> list[str]:
+        required: list[str] = []
+        for block in blocks:
+            for ex in block.get("exercises", []):
+                name = str(ex.get("name") or "").strip()
+                if not name:
+                    continue
+                required.append(name)
+        return required
+
+    def _extract_required_exercise_lines(self, blocks: list[dict[str, Any]]) -> list[str]:
+        lines: list[str] = []
+        for block in blocks:
+            for ex in block.get("exercises", []):
+                name = str(ex.get("name") or "").strip()
+                sets = int(ex.get("sets") or 1)
+                low = ex.get("rep_range_low")
+                high = ex.get("rep_range_high")
+                if not name:
+                    continue
+                if low is None or high is None:
+                    lines.append(f"{name} - {sets}xAMRAP")
+                elif low == high:
+                    lines.append(f"{name} - {sets}x{low}")
+                else:
+                    lines.append(f"{name} - {sets}x{low}-{high}")
+        return lines
+
+    def _violates_required_constraints(self, parsed: dict[str, Any], required_exercises: list[str]) -> bool:
+        if not required_exercises:
+            return False
+        parsed_names = [
+            self._normalize_name(ex.get("name", ""))
+            for day in parsed.get("days", [])
+            for ex in day.get("exercises", [])
+        ]
+        required_names = [self._normalize_name(name) for name in required_exercises]
+        parsed_counter = Counter(parsed_names)
+        required_counter = Counter(required_names)
+        for name, required_count in required_counter.items():
+            if parsed_counter.get(name, 0) < required_count:
+                return True
+        return False
+
+    def _repair_missing_required_exercises(
+        self,
+        parsed: dict[str, Any],
+        required_exercises: list[str],
+    ) -> dict[str, Any]:
+        required_counter = Counter(self._normalize_name(name) for name in required_exercises)
+        parsed_names = [
+            self._normalize_name(ex.get("name", ""))
+            for day in parsed.get("days", [])
+            for ex in day.get("exercises", [])
+        ]
+        parsed_counter = Counter(parsed_names)
+        if parsed_counter == required_counter:
+            return parsed
+
+        # Keep parsed shape; rename extras using required order where possible.
+        missing_norms: list[str] = []
+        for norm, count in required_counter.items():
+            deficit = count - parsed_counter.get(norm, 0)
+            if deficit > 0:
+                missing_norms.extend([norm] * deficit)
+        if not missing_norms:
+            return parsed
+
+        required_lookup: dict[str, list[str]] = {}
+        for name in required_exercises:
+            norm = self._normalize_name(name)
+            required_lookup.setdefault(norm, []).append(name)
+
+        for day in parsed.get("days", []):
+            for ex in day.get("exercises", []):
+                norm = self._normalize_name(ex.get("name", ""))
+                if parsed_counter.get(norm, 0) <= required_counter.get(norm, 0):
+                    continue
+                if not missing_norms:
+                    return parsed
+                replacement_norm = missing_norms.pop(0)
+                options = required_lookup.get(replacement_norm, [])
+                replacement_name = options.pop(0) if options else ex.get("name", "")
+                required_lookup[replacement_norm] = options
+                parsed_counter[norm] -= 1
+                parsed_counter[replacement_norm] += 1
+                ex["name"] = str(replacement_name)
+        return parsed
+
+    def _count_day_headers(self, text: str) -> int:
+        count = 0
+        for line in text.splitlines():
+            if self._detect_day_header(line):
+                count += 1
+        return count
+
+    def _align_day_count_with_headers(
+        self,
+        parsed: dict[str, Any],
+        blocks: list[dict[str, Any]],
+        header_count: int,
+    ) -> dict[str, Any]:
+        if blocks and len(blocks) == header_count:
+            parsed = self._rebuild_from_day_blocks(parsed, blocks)
+        current = parsed.get("days", [])
+        if len(current) >= header_count:
+            return parsed
+
+        for idx in range(len(current), header_count):
+            parsed["days"].append(
+                {
+                    "day_order": idx,
+                    "name": f"Day {idx + 1}",
+                    "exercises": [],
+                }
+            )
         return parsed
 
     def _repair_duplicate_names_from_raw(
@@ -429,20 +594,31 @@ class ProgramParser:
                 current = {"name": maybe_header, "exercises": []}
                 continue
 
-            parsed_ex = self._parse_exercise_line(line)
-            if not parsed_ex:
+            parsed_items = self._parse_exercise_line_items(line)
+            if not parsed_items:
                 continue
 
             if current is None:
                 current = {"name": "Day 1", "exercises": []}
-            current["exercises"].append(parsed_ex)
+            current["exercises"].extend(parsed_items)
 
         if current:
             blocks.append(current)
+        return blocks
 
-        # Reject tiny accidental parses.
-        valid_blocks = [b for b in blocks if b["exercises"]]
-        return valid_blocks
+    def _parse_exercise_line_items(self, line: str) -> list[dict[str, Any]]:
+        parsed = self._parse_exercise_line(line)
+        if parsed:
+            return [parsed]
+
+        # Support compact lines with multiple exercises separated by semicolons/pipes.
+        segments = re.split(r"[;|]+", line)
+        out: list[dict[str, Any]] = []
+        for segment in segments:
+            item = self._parse_exercise_line(segment.strip())
+            if item:
+                out.append(item)
+        return out
 
     def _detect_day_header(self, line: str) -> Optional[str]:
         cleaned = BULLET_PREFIX_RE.sub("", line).strip("-: ")

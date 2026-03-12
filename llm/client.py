@@ -21,6 +21,7 @@ class OllamaClient:
         system: str,
         user: str,
         temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
     ) -> str:
         payload: dict[str, Any] = {
@@ -36,6 +37,8 @@ class OllamaClient:
         }
         if response_format:
             payload["format"] = response_format
+        if max_tokens is not None and max_tokens > 0:
+            payload["options"]["num_predict"] = int(max_tokens)
 
         response = await self._client.post(f"{self.base_url}/api/chat", json=payload)
         response.raise_for_status()
@@ -49,8 +52,14 @@ class OllamaClient:
         system: str,
         user: str,
         temperature: float = 0.1,
+        max_tokens: Optional[int] = None,
     ) -> Any:
-        text = await self.chat(system=system, user=user, temperature=temperature)
+        text = await self.chat(
+            system=system,
+            user=user,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         cleaned = self._extract_json_block(text)
         return json.loads(cleaned)
 
