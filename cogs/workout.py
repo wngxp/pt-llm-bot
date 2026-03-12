@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -53,11 +53,23 @@ EARLY_END_INTENTS = {
     "end workout",
     "end session",
     "quit",
+    "move on",
+    "moveon",
 }
 YES_TOKENS = {"yes", "y", "yeah", "yep", "sure"}
 NO_TOKENS = {"no", "n", "nah", "nope", "cancel", "continue"}
 RESUME_TOKENS = {"resume", "pause", "later", "resume later"}
-MOVE_ON_TOKENS = {"move on", "moveon", "advance", "next day", "end and move on"}
+MOVE_ON_TOKENS = {
+    "move on",
+    "moveon",
+    "move",
+    "m",
+    "advance",
+    "next day",
+    "end and move on",
+    "done",
+    "end",
+}
 FATIGUE_CUE_WORDS = {
     "tired",
     "cant do any more",
@@ -89,6 +101,7 @@ QUESTION_WORDS = {
 
 MAX_WEIGHT_BY_UNIT = {"lbs": 1500.0, "kg": 700.0}
 MAX_REPS = 200
+ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 
 
 @dataclass(slots=True)
@@ -109,6 +122,7 @@ class WorkoutSession:
     started_at: datetime
     current_index: int = 0
     set_counts: dict[int, int] = field(default_factory=dict)
+    total_exercises: int = 0
     presented_exercises: set[int] = field(default_factory=set)
     exercise_units: dict[int, str] = field(default_factory=dict)
     logged_sets: list[dict[str, Any]] = field(default_factory=list)
@@ -119,6 +133,7 @@ class WorkoutSession:
     superset: Optional[SupersetState] = None
     rest_task: Optional[asyncio.Task] = None
     rest_seconds: int = 0
+    day_activity_warning: Optional[str] = None
 
     def current_exercise(self) -> Optional[dict[str, Any]]:
         if self.superset:
@@ -140,6 +155,7 @@ class WorkoutCog(commands.Cog):
         self.sessions: dict[int, WorkoutSession] = {}
         self.user_locks: dict[int, asyncio.Lock] = {}
         self.early_end_prompts: dict[tuple[int, int], dict[str, Any]] = {}
+        self.early_end_timeout_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
     def _is_workout_channel(self, channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel) -> bool:
         cid = getattr(channel, "id", None)
@@ -211,18 +227,24 @@ class WorkoutCog(commands.Cog):
         completed_exercises = sum(
             1 for ex in session.exercises if session.set_counts.get(int(ex["id"]), 0) > 0
         )
-        total_exercises = max(1, len(session.exercises))
+        total_exercises = max(1, int(session.total_exercises or len(session.exercises)))
         progress = completed_exercises / total_exercises
         return completed_exercises, total_exercises, progress
 
+    def _normalize_user_text(self, text: str) -> str:
+        cleaned = ZERO_WIDTH_RE.sub("", text or "")
+        cleaned = re.sub(r"[^a-zA-Z0-9\\s']+", " ", cleaned)
+        cleaned = " ".join(cleaned.strip().lower().split())
+        return cleaned
+
     def _is_early_end_intent(self, text: str) -> bool:
-        lowered = text.strip().lower()
+        lowered = self._normalize_user_text(text)
         if lowered in EARLY_END_INTENTS:
             return True
         return any(intent in lowered for intent in EARLY_END_INTENTS)
 
     def _matches_token(self, text: str, tokens: set[str]) -> bool:
-        lowered = text.strip().lower()
+        lowered = self._normalize_user_text(text)
         for token in tokens:
             if lowered == token:
                 return True
@@ -242,7 +264,9 @@ class WorkoutCog(commands.Cog):
             "completed": completed,
             "total": total,
             "progress": progress,
+            "expires_at": datetime.now(timezone.utc) + timedelta(seconds=60),
         }
+        self._schedule_early_end_timeout((channel.id, user_id), channel, session)
         await send_discord_text(
             channel,
             f"You've completed {completed}/{total} exercises. Are you sure you want to end early? Reply `yes` or `no`."
@@ -271,9 +295,14 @@ class WorkoutCog(commands.Cog):
         next_index = await self.db.advance_day_index()
         next_day = await self.db.get_day_for_index(next_index)
         next_name = str(next_day["name"]) if next_day else "next day"
+        progress_line = (
+            f"No exercises completed in this session."
+            if completed == 0
+            else f"{session.day['name']} session ended at {completed}/{total} exercises."
+        )
         await send_discord_text(
             channel,
-            f"{session.day['name']} session ended at {completed}/{total} exercises. "
+            f"{progress_line} "
             f"Next time you type `ready`, you'll start {next_name} (Day {next_index + 1}).{streak_line}",
         )
 
@@ -281,6 +310,39 @@ class WorkoutCog(commands.Cog):
         keys = [key for key in self.early_end_prompts if key[0] == channel_id]
         for key in keys:
             self.early_end_prompts.pop(key, None)
+            task = self.early_end_timeout_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+
+    def _schedule_early_end_timeout(
+        self,
+        key: tuple[int, int],
+        channel: discord.abc.Messageable,
+        session: WorkoutSession,
+    ) -> None:
+        existing = self.early_end_timeout_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+
+        async def _timeout() -> None:
+            try:
+                await asyncio.sleep(60)
+                prompt = self.early_end_prompts.get(key)
+                if not prompt:
+                    return
+                current_session = self.sessions.get(session.channel_id)
+                if current_session is not session:
+                    self.early_end_prompts.pop(key, None)
+                    return
+                self.early_end_prompts.pop(key, None)
+                await send_discord_text(channel, "No response received. Continuing current session.")
+                await self._prompt_current_exercise(channel, session)
+            except asyncio.CancelledError:
+                return
+            finally:
+                self.early_end_timeout_tasks.pop(key, None)
+
+        self.early_end_timeout_tasks[key] = asyncio.create_task(_timeout())
 
     async def _handle_early_end_prompt(
         self,
@@ -291,7 +353,7 @@ class WorkoutCog(commands.Cog):
     ) -> bool:
         key = (channel.id, user_id)
         prompt = self.early_end_prompts.get(key)
-        lowered = text.strip().lower()
+        lowered = self._normalize_user_text(text)
 
         if prompt is None:
             if not self._is_early_end_intent(text):
@@ -299,30 +361,53 @@ class WorkoutCog(commands.Cog):
             await self._begin_early_end_prompt(channel, user_id, session)
             return True
 
+        expires_at = prompt.get("expires_at")
+        if isinstance(expires_at, datetime) and datetime.now(timezone.utc) > expires_at:
+            self.early_end_prompts.pop(key, None)
+            task = self.early_end_timeout_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+            await send_discord_text(channel, "Early-end prompt timed out. Continuing current session.")
+            await self._prompt_current_exercise(channel, session)
+            return True
+
         step = prompt.get("step")
         completed = int(prompt.get("completed", 0))
-        total = int(prompt.get("total", len(session.exercises)))
+        total = int(prompt.get("total", session.total_exercises or len(session.exercises)))
         progress = float(prompt.get("progress", 0.0))
 
         if step == "confirm":
             if self._matches_token(lowered, YES_TOKENS):
                 if progress < 0.5:
+                    if completed == 0:
+                        text = (
+                            "No exercises completed yet. Want to try again later?\n"
+                            "Reply `resume` to continue later today in this channel, or `move on` to end and advance."
+                        )
+                    else:
+                        text = (
+                            f"No worries - some work is better than none. You finished {completed} exercises.\n"
+                            "Reply `resume` to continue later today in this channel, or `move on` to end and advance."
+                        )
                     await send_discord_text(
                         channel,
-                        f"No worries - some work is better than none. You crushed those {completed} exercises. "
-                        "Pick up where you left off next time?\n"
-                        "Reply `resume` to continue later today in this channel, or `move on` to end and advance."
+                        text,
                     )
                 else:
                     await send_discord_text(
                         channel,
                         "Solid session - you got through most of it. Rest up.\n"
                         "Reply `resume` to continue later today in this channel, or `move on` to end and advance."
-                )
+                    )
                 prompt["step"] = "decision"
+                prompt["expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+                self._schedule_early_end_timeout(key, channel, session)
                 return True
             if self._matches_token(lowered, NO_TOKENS):
                 self.early_end_prompts.pop(key, None)
+                task = self.early_end_timeout_tasks.pop(key, None)
+                if task and not task.done():
+                    task.cancel()
                 await send_discord_text(channel, "Continuing current session.")
                 await self._prompt_current_exercise(channel, session)
                 return True
@@ -337,6 +422,9 @@ class WorkoutCog(commands.Cog):
                 session.paused = True
                 session.paused_local_date = now_local.date().isoformat()
                 self.early_end_prompts.pop(key, None)
+                task = self.early_end_timeout_tasks.pop(key, None)
+                if task and not task.done():
+                    task.cancel()
                 await send_discord_text(
                     channel,
                     f"Session paused at {completed}/{total} exercises. "
@@ -344,18 +432,24 @@ class WorkoutCog(commands.Cog):
                 )
                 return True
 
-                if self._matches_token(lowered, MOVE_ON_TOKENS) or "move on" in lowered:
-                    self.early_end_prompts.pop(key, None)
-                    await self._end_session_early(
-                        channel,
-                        session,
-                        completed=completed,
-                        total=total,
-                    )
-                    return True
+            if self._matches_token(lowered, MOVE_ON_TOKENS) or "move on" in lowered:
+                self.early_end_prompts.pop(key, None)
+                task = self.early_end_timeout_tasks.pop(key, None)
+                if task and not task.done():
+                    task.cancel()
+                await self._end_session_early(
+                    channel,
+                    session,
+                    completed=completed,
+                    total=total,
+                )
+                return True
 
             if self._matches_token(lowered, NO_TOKENS):
                 self.early_end_prompts.pop(key, None)
+                task = self.early_end_timeout_tasks.pop(key, None)
+                if task and not task.done():
+                    task.cancel()
                 await send_discord_text(channel, "Continuing current session.")
                 await self._prompt_current_exercise(channel, session)
                 return True
@@ -364,6 +458,9 @@ class WorkoutCog(commands.Cog):
             return True
 
         self.early_end_prompts.pop(key, None)
+        task = self.early_end_timeout_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
         return False
 
     async def _start_session(self, channel: discord.abc.Messageable) -> Optional[WorkoutSession]:
@@ -390,6 +487,7 @@ class WorkoutCog(commands.Cog):
             exercises=exercises,
             started_at=datetime.now(),
             set_counts={int(ex["id"]): 0 for ex in exercises},
+            total_exercises=len(exercises),
         )
         self.sessions[session.channel_id] = session
         self._clear_early_end_prompts_for_channel(session.channel_id)
@@ -399,6 +497,10 @@ class WorkoutCog(commands.Cog):
             channel,
             f"Starting **{day['name']}** (Day {day_index + 1} of {total_days})."
         )
+
+        session.day_activity_warning = await self._day_activity_warning(exercises)
+        if session.day_activity_warning:
+            await send_discord_text(channel, session.day_activity_warning)
 
         state = await self.db.get_user_state()
         last_workout = state.get("last_workout_date")
@@ -434,8 +536,31 @@ class WorkoutCog(commands.Cog):
             return
 
         logs = await self.db.get_last_logs_for_exercise(int(exercise["id"]), limit=3)
-        adjustment_multiplier, activity_note = await self._activity_adjustment_for_exercise(exercise)
-        suggestion = suggest_weight(exercise, logs, adjustment_multiplier=adjustment_multiplier)
+        activity_multiplier, activity_note = await self._activity_adjustment_for_exercise(exercise)
+        state = await self.db.get_user_state()
+        readiness = int(state.get("readiness") or 7)
+        readiness_multiplier = 1.0
+        readiness_note: Optional[str] = None
+        if readiness >= 8:
+            readiness_multiplier = 1.03
+            readiness_note = f"Readiness is high ({readiness}/10). You can push the top end if form stays crisp."
+        elif readiness >= 6:
+            readiness_multiplier = 1.0
+        elif readiness >= 4:
+            readiness_multiplier = 0.9
+            readiness_note = f"⚠️ Readiness is low ({readiness}/10). Going lighter today."
+        else:
+            readiness_multiplier = 0.8
+            readiness_note = (
+                f"⚠️ Readiness is very low ({readiness}/10). Consider a light technique session or rest."
+            )
+
+        final_multiplier = activity_multiplier * readiness_multiplier
+        suggestion = suggest_weight(exercise, logs, adjustment_multiplier=final_multiplier)
+        if not logs and readiness <= 5:
+            suggestion = (
+                f"{suggestion} Since readiness is low, use ~10% less than your typical starting load."
+            )
 
         last_lines: list[str] = []
         if logs:
@@ -449,7 +574,7 @@ class WorkoutCog(commands.Cog):
         warmup = None
         category = str(exercise.get("category") or "cable_machine")
         if category in {"heavy_barbell", "light_barbell"} and logs:
-            basis_weight = float(logs[0]["weight"]) * adjustment_multiplier
+            basis_weight = float(logs[0]["weight"]) * final_multiplier
             basis_unit = str(logs[0].get("unit") or "lbs")
             if basis_weight > 0:
                 warmup = generate_warmup(basis_weight, category, basis_unit)
@@ -470,6 +595,8 @@ class WorkoutCog(commands.Cog):
 
         if activity_note:
             lines.append(activity_note)
+        if readiness_note:
+            lines.append(readiness_note)
         lines.append(format_exercise_brief(exercise))
         lines.extend(last_lines)
         lines.append(f"Suggestion: {suggestion}")
@@ -661,10 +788,91 @@ class WorkoutCog(commands.Cog):
         return None
 
     def _split_groups(self, value: str) -> set[str]:
-        return {part.strip().lower() for part in str(value or "").split(",") if part.strip()}
+        groups: set[str] = set()
+        for part in str(value or "").split(","):
+            cleaned = part.strip().lower()
+            if not cleaned:
+                continue
+            norm = re.sub(r"[^a-z0-9]+", "", cleaned)
+            if not norm:
+                continue
+            groups.add(norm)
+            if norm in {"leg", "legs", "lowerbody"}:
+                groups.update({"legs", "quads", "hamstrings", "glutes", "calves"})
+            if norm in {"quad", "quads"}:
+                groups.update({"quads", "legs"})
+            if norm in {"hamstring", "hamstrings"}:
+                groups.update({"hamstrings", "legs"})
+            if norm in {"glute", "glutes"}:
+                groups.update({"glutes", "legs"})
+            if norm in {"calf", "calves"}:
+                groups.update({"calves", "legs"})
+            if norm in {"back", "lats", "upperback", "traps"}:
+                groups.update({"back", "lats", "upperback"})
+            if norm in {"shoulder", "shoulders", "delts"}:
+                groups.update({"shoulders", "delts"})
+        return groups
+
+    def _infer_groups_from_exercise_name(self, name: str) -> set[str]:
+        lowered = name.lower()
+        groups: set[str] = set()
+        if any(token in lowered for token in {"squat", "deadlift", "rdl", "sldl", "lunge", "leg", "calf"}):
+            groups.update({"legs", "quads", "hamstrings", "glutes", "calves"})
+        if any(token in lowered for token in {"bench", "chest", "fly"}):
+            groups.add("chest")
+        if any(token in lowered for token in {"row", "pulldown", "pull", "chin", "lat"}):
+            groups.update({"back", "lats"})
+        if any(token in lowered for token in {"curl"}):
+            groups.add("biceps")
+        if any(token in lowered for token in {"triceps", "pushdown", "extension"}):
+            groups.add("triceps")
+        if any(token in lowered for token in {"press", "raise", "ohp", "shoulder"}):
+            groups.update({"shoulders", "delts"})
+        return groups
+
+    async def _day_activity_warning(self, exercises: list[dict[str, Any]]) -> Optional[str]:
+        activities = await self.db.get_recent_activities(hours=72)
+        if not activities:
+            return None
+
+        day_groups: set[str] = set()
+        for ex in exercises:
+            groups = self._split_groups(str(ex.get("muscle_groups") or ""))
+            if not groups:
+                groups = self._infer_groups_from_exercise_name(str(ex.get("name") or ""))
+            day_groups.update(groups)
+        if not day_groups:
+            return None
+
+        high_hit: Optional[dict[str, Any]] = None
+        moderate_hit: Optional[dict[str, Any]] = None
+
+        for activity in activities:
+            activity_groups = self._split_groups(str(activity.get("muscle_groups") or ""))
+            if not activity_groups:
+                activity_groups = self._infer_groups_from_exercise_name(str(activity.get("description") or ""))
+            if not activity_groups:
+                continue
+            if day_groups.isdisjoint(activity_groups):
+                continue
+            intensity = str(activity.get("intensity") or "moderate").lower()
+            if intensity == "high" and high_hit is None:
+                high_hit = activity
+            elif intensity == "moderate" and moderate_hit is None:
+                moderate_hit = activity
+
+        if high_hit:
+            detail = str(high_hit.get("description") or high_hit.get("activity_type") or "recent activity")
+            return f"⚠️ You logged a hard session recently ({detail}) affecting today's muscles. Consider going lighter today."
+        if moderate_hit:
+            detail = str(moderate_hit.get("description") or moderate_hit.get("activity_type") or "recent activity")
+            return f"Recovery note: recent moderate activity overlaps with today's muscles ({detail})."
+        return None
 
     async def _activity_adjustment_for_exercise(self, exercise: dict[str, Any]) -> tuple[float, Optional[str]]:
         exercise_groups = self._split_groups(str(exercise.get("muscle_groups") or ""))
+        if not exercise_groups:
+            exercise_groups = self._infer_groups_from_exercise_name(str(exercise.get("name") or ""))
         if not exercise_groups:
             return 1.0, None
 
@@ -679,6 +887,8 @@ class WorkoutCog(commands.Cog):
 
         for activity in activities:
             groups = self._split_groups(str(activity.get("muscle_groups") or ""))
+            if not groups:
+                groups = self._infer_groups_from_exercise_name(str(activity.get("description") or ""))
             if not groups:
                 continue
             if exercise_groups.isdisjoint(groups):
@@ -747,6 +957,7 @@ class WorkoutCog(commands.Cog):
         key = exercise_name.strip().lower()
         e1rm = epley_1rm(weight, reps)
         existing = await self.db.get_best_pr(exercise_name)
+        announce_categories = {"heavy_barbell", "light_barbell", "bodyweight"}
 
         if not existing:
             logger.debug("PR baseline created for %s: %s %s x %s", exercise_name, weight, unit, reps)
@@ -760,6 +971,14 @@ class WorkoutCog(commands.Cog):
                 workout_log_id=workout_log_id,
             )
             session.baseline_exercises.add(key)
+            if category in announce_categories:
+                return (
+                    None,
+                    (
+                        f"🏁 First {exercise_name} logged! "
+                        f"{format_standard_number(weight)} {unit} x {reps} - this is your starting benchmark."
+                    ),
+                )
             return None, None
 
         pr_type: Optional[str] = None
@@ -803,7 +1022,6 @@ class WorkoutCog(commands.Cog):
         if key in session.baseline_exercises:
             return None, None
 
-        announce_categories = {"heavy_barbell", "light_barbell", "bodyweight"}
         if category not in announce_categories:
             return None, None
 
@@ -1162,7 +1380,7 @@ class WorkoutCog(commands.Cog):
         if not content or content.startswith(self.settings.command_prefix):
             return
 
-        lowered = content.lower().strip()
+        lowered = self._normalize_user_text(content)
         session = self.sessions.get(message.channel.id)
 
         if not session:

@@ -1,3 +1,19 @@
+## [0.3.0] - 2026-03-12
+### Fixed
+- Relaxed prompt guardrails so fitness-adjacent requests (equipment swaps, nutrition/recovery topics) are answered normally while still declining prompt-injection attempts.
+- `#programme` no longer auto-imports pasted programs; it now stages draft analysis, suggests swaps, and imports only after user confirmation (`save`).
+- Increased `#ask` response budget (`max_tokens=300`) to avoid cut-off replies.
+- Fixed early-exit `move on` loop by normalizing input, accepting broader move-on variants, and correcting decision-branch handling.
+- Added early-exit timeout handling (60s) that auto-resumes instead of leaving users stuck.
+- Improved early-exit copy for zero-completion sessions (`No exercises completed...`) and cleaned up confirmation flow.
+- Added first-benchmark announcement for first-ever compound/bodyweight logs (for example: first Squat benchmark message).
+- Activity impact now surfaces at session start and influences overlapping exercise suggestions in the next 72 hours.
+- Readiness score now directly affects suggestions and messaging (high/normal/low/very low paths).
+
+### Added
+- Startup changelog auto-post support with `CHANGELOG_CHANNEL_ID` and version-change dedupe via local state file.
+- New `restart.sh` script that initializes Conda correctly in non-interactive shells before launching the bot.
+
 ## [0.2.0] - 2026-03-11
 ### Fixed
 - Input parser now accepts natural language ("i hit 225 x 3")

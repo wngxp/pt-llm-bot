@@ -24,6 +24,7 @@ class Settings:
     ask_channel_id: Optional[int]
     prs_channel_id: Optional[int]
     settings_channel_id: Optional[int]
+    changelog_channel_id: Optional[int]
     workout_channel_ids: set[int]
     command_prefix: str
 
@@ -66,6 +67,7 @@ def load_settings() -> Settings:
         ask_channel_id=_opt_int("ASK_CHANNEL_ID"),
         prs_channel_id=_opt_int("PRS_CHANNEL_ID"),
         settings_channel_id=_opt_int("SETTINGS_CHANNEL_ID"),
+        changelog_channel_id=_opt_int("CHANGELOG_CHANNEL_ID"),
         workout_channel_ids=_int_set("WORKOUT_CHANNEL_IDS"),
         command_prefix=os.getenv("COMMAND_PREFIX", "!"),
     )

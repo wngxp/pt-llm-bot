@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -20,6 +21,18 @@ DAY_NUMBER_RE = re.compile(r"\bday\s*(?P<day_num>\d+)\b", re.IGNORECASE)
 START_DAY_INTENT_RE = re.compile(r"\b(start|begin|starting|start on|begin with)\b", re.IGNORECASE)
 EDIT_INTENT_RE = re.compile(r"\b(edit|swap|replace|change|modify)\b", re.IGNORECASE)
 SET_PATTERN_RE = re.compile(r"\d+\s*[xX×]\s*\d+")
+PENDING_CONFIRM_TOKENS = {"save", "confirm", "import", "looks good", "ship it", "yes"}
+PENDING_CANCEL_TOKENS = {"cancel", "stop", "never mind", "discard"}
+
+
+@dataclass(slots=True)
+class PendingProgram:
+    user_id: int
+    channel_id: int
+    raw_text: str
+    created_at: datetime
+    notes: list[str] = field(default_factory=list)
+    latest_suggestions: str = ""
 
 
 class ProgrammeCog(commands.Cog):
@@ -29,6 +42,7 @@ class ProgrammeCog(commands.Cog):
         self.db = bot.db
         self.parser = ProgramParser(bot.ollama)
         self.post_import_state: dict[int, dict[str, Any]] = {}
+        self.pending_programs: dict[tuple[int, int], PendingProgram] = {}
         self.memory = ConversationMemory(max_messages=10, ttl_minutes=30)
 
     def _is_programme_channel(self, channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel) -> bool:
@@ -90,6 +104,57 @@ class ProgrammeCog(commands.Cog):
         day_markers = any(token in lowered for token in ["day ", "push", "pull", "legs", "upper", "lower"])
         return day_markers
 
+    def _normalize_name(self, text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+    def _parse_start_day_index(self, text: str, days: list[dict[str, Any]]) -> Optional[int]:
+        match = DAY_NUMBER_RE.search(text)
+        if match:
+            idx = int(match.group("day_num")) - 1
+            if 0 <= idx < len(days):
+                return idx
+
+        lowered = text.lower()
+        for day in days:
+            day_name = str(day.get("name") or "").strip()
+            if day_name and day_name.lower() in lowered:
+                return int(day["day_order"])
+
+        normalized_text = self._normalize_name(text)
+        for day in days:
+            day_name = self._normalize_name(str(day.get("name") or ""))
+            if day_name and day_name in normalized_text:
+                return int(day["day_order"])
+
+        return None
+
+    def _pending_key(self, user_id: int, channel_id: int) -> tuple[int, int]:
+        return (int(user_id), int(channel_id))
+
+    def _get_pending_program(self, user_id: int, channel_id: int) -> Optional[PendingProgram]:
+        key = self._pending_key(user_id, channel_id)
+        state = self.pending_programs.get(key)
+        if not state:
+            return None
+        if state.created_at + timedelta(minutes=30) < self._now_utc():
+            self.pending_programs.pop(key, None)
+            return None
+        return state
+
+    def _set_pending_program(self, state: PendingProgram) -> None:
+        self.pending_programs[self._pending_key(state.user_id, state.channel_id)] = state
+
+    def _clear_pending_program(self, user_id: int, channel_id: int) -> None:
+        self.pending_programs.pop(self._pending_key(user_id, channel_id), None)
+
+    def _is_confirm_message(self, text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        return normalized in PENDING_CONFIRM_TOKENS or normalized.startswith("save")
+
+    def _is_cancel_message(self, text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        return normalized in PENDING_CANCEL_TOKENS
+
     async def _resolve_program_name(
         self,
         channel: discord.abc.Messageable,
@@ -127,56 +192,6 @@ class ProgrammeCog(commands.Cog):
             lines.append(f"{day['day_order'] + 1}. {day['name']}")
         lines.append("Reply with `start on Legs` or `start on Day 3`.")
         await send_discord_text(channel, "\n".join(lines))
-
-    async def _import_program(
-        self,
-        channel: discord.abc.Messageable,
-        author: discord.abc.User,
-        raw_text: str,
-    ) -> int:
-        parsed = await self.parser.parse_program(raw_text)
-        parsed["program_name"] = await self._resolve_program_name(
-            channel,
-            author,
-            raw_text,
-            str(parsed.get("program_name") or ""),
-        )
-        program_id = await self.db.create_program_from_payload(parsed)
-
-        days = parsed.get("days", [])
-        total_exercises = sum(len(day.get("exercises", [])) for day in days)
-        await send_discord_text(
-            channel,
-            f"✅ Imported **{parsed['program_name']}** (ID {program_id}) with "
-            f"{len(days)} days and {total_exercises} exercises.",
-        )
-        self._set_post_import_context(author.id, getattr(channel, "id", 0), program_id)
-        await self._start_day_prompt(channel, program_id)
-        return program_id
-
-    def _normalize_name(self, text: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", text.lower())
-
-    def _parse_start_day_index(self, text: str, days: list[dict[str, Any]]) -> Optional[int]:
-        match = DAY_NUMBER_RE.search(text)
-        if match:
-            idx = int(match.group("day_num")) - 1
-            if 0 <= idx < len(days):
-                return idx
-
-        lowered = text.lower()
-        for day in days:
-            day_name = str(day.get("name") or "").strip()
-            if day_name and day_name.lower() in lowered:
-                return int(day["day_order"])
-
-        normalized_text = self._normalize_name(text)
-        for day in days:
-            day_name = self._normalize_name(str(day.get("name") or ""))
-            if day_name and day_name in normalized_text:
-                return int(day["day_order"])
-
-        return None
 
     async def _handle_start_day_message(self, channel: discord.abc.Messageable, text: str) -> bool:
         active = await self.db.get_active_program()
@@ -256,7 +271,7 @@ class ProgrammeCog(commands.Cog):
                     ),
                     user=json.dumps(context, ensure_ascii=False),
                     temperature=0.2,
-                    max_tokens=180,
+                    max_tokens=220,
                 )
                 await send_discord_text(channel, reply.strip())
             except Exception:
@@ -264,6 +279,102 @@ class ProgrammeCog(commands.Cog):
             return True
 
         return False
+
+    async def _suggest_pending_changes(self, state: PendingProgram) -> str:
+        history = self.memory.get(user_id=state.user_id, channel_id=state.channel_id)
+        payload = {
+            "program_text": state.raw_text,
+            "user_constraints": state.notes,
+            "history": history,
+            "task": "Review this program and propose practical swaps/edits based on constraints.",
+            "format": "Use concise bullet points, then a 1-line question.",
+        }
+        reply = await self.bot.ollama.chat(
+            system=(
+                f"{FITNESS_ONLY_GUARDRAIL}\n"
+                "You are reviewing a workout program before import. "
+                "Focus on feasibility with equipment constraints and training goals."
+            ),
+            user=json.dumps(payload, ensure_ascii=False),
+            temperature=0.2,
+            max_tokens=380,
+        )
+        return reply.strip()
+
+    async def _render_program_for_import(self, state: PendingProgram) -> str:
+        if not state.notes:
+            return state.raw_text
+
+        payload = {
+            "program_text": state.raw_text,
+            "requested_changes": state.notes,
+            "instructions": "Return only the finalized program text with day headers and exercise lines. No commentary.",
+        }
+        rewritten = await self.bot.ollama.chat(
+            system=(
+                f"{FITNESS_ONLY_GUARDRAIL}\n"
+                "Rewrite the workout program text by applying the requested changes. "
+                "Preserve clear day/exercise structure and sets x reps."
+            ),
+            user=json.dumps(payload, ensure_ascii=False),
+            temperature=0.15,
+            max_tokens=900,
+        )
+        return rewritten.strip() or state.raw_text
+
+    async def _start_pending_program(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        raw_text: str,
+    ) -> None:
+        state = PendingProgram(
+            user_id=author.id,
+            channel_id=getattr(channel, "id", 0),
+            raw_text=raw_text,
+            created_at=self._now_utc(),
+        )
+        self._set_pending_program(state)
+        suggestions = await self._suggest_pending_changes(state)
+        state.latest_suggestions = suggestions
+        self._set_pending_program(state)
+        await send_discord_text(
+            channel,
+            f"I reviewed your program before importing.\n\n{suggestions}\n\n"
+            "Reply with edits if you want changes, `save` to import, or `cancel` to discard.",
+        )
+
+    async def _finalize_pending_program(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        state: PendingProgram,
+    ) -> None:
+        final_text = state.raw_text
+        try:
+            final_text = await self._render_program_for_import(state)
+        except Exception:
+            final_text = state.raw_text
+
+        parsed = await self.parser.parse_program(final_text)
+        parsed["program_name"] = await self._resolve_program_name(
+            channel,
+            author,
+            final_text,
+            str(parsed.get("program_name") or ""),
+        )
+        program_id = await self.db.create_program_from_payload(parsed)
+
+        days = parsed.get("days", [])
+        total_exercises = sum(len(day.get("exercises", [])) for day in days)
+        self._clear_pending_program(state.user_id, state.channel_id)
+        await send_discord_text(
+            channel,
+            f"✅ Imported **{parsed['program_name']}** (ID {program_id}) with "
+            f"{len(days)} days and {total_exercises} exercises.",
+        )
+        self._set_post_import_context(author.id, getattr(channel, "id", 0), program_id)
+        await self._start_day_prompt(channel, program_id)
 
     async def _reply_programme_message(
         self,
@@ -284,18 +395,18 @@ class ProgrammeCog(commands.Cog):
             "program": active,
             "days": days,
             "history": history,
-            "response_style": "2-3 short sentences.",
+            "response_style": "2-4 short sentences.",
         }
         try:
             reply = await self.bot.ollama.chat(
                 system=(
                     f"{FITNESS_ONLY_GUARDRAIL}\n"
                     "You help users discuss and update their lifting program. "
-                    "Always answer concisely in 2-3 short sentences."
+                    "Answer concisely and practically."
                 ),
                 user=json.dumps(payload, ensure_ascii=False),
                 temperature=0.2,
-                max_tokens=200,
+                max_tokens=300,
             )
             reply_text = reply.strip()
             self.memory.append(
@@ -312,7 +423,7 @@ class ProgrammeCog(commands.Cog):
     async def import_program_command(self, ctx: commands.Context, *, text: str) -> None:
         if not self._is_programme_channel(ctx.channel):
             return
-        await self._import_program(ctx.channel, ctx.author, text)
+        await self._start_pending_program(ctx.channel, ctx.author, text)
 
     @commands.command(name="program")
     async def show_program_command(self, ctx: commands.Context) -> None:
@@ -399,11 +510,42 @@ class ProgrammeCog(commands.Cog):
         context = self._get_post_import_context(user_id, channel_id)
         self.memory.append(user_id=user_id, channel_id=channel_id, role="user", content=content)
 
+        pending = self._get_pending_program(user_id, channel_id)
+
         if self._looks_like_program_paste(content):
             try:
-                await self._import_program(message.channel, message.author, content)
+                await self._start_pending_program(message.channel, message.author, content)
             except Exception as exc:
-                await send_discord_text(message.channel, f"Could not parse program: {exc}")
+                await send_discord_text(message.channel, f"Could not process program draft: {exc}")
+            return
+
+        if pending:
+            if self._is_cancel_message(content):
+                self._clear_pending_program(user_id, channel_id)
+                await send_discord_text(message.channel, "Pending program import discarded.")
+                return
+            if self._is_confirm_message(content):
+                try:
+                    await self._finalize_pending_program(message.channel, message.author, pending)
+                except Exception as exc:
+                    await send_discord_text(message.channel, f"Could not import program: {exc}")
+                return
+            pending.notes.append(content)
+            pending.created_at = self._now_utc()
+            self._set_pending_program(pending)
+            try:
+                pending.latest_suggestions = await self._suggest_pending_changes(pending)
+                self._set_pending_program(pending)
+                await send_discord_text(
+                    message.channel,
+                    f"Updated suggestions:\n\n{pending.latest_suggestions}\n\n"
+                    "Reply with more edits, `save` to import, or `cancel`.",
+                )
+            except Exception:
+                await send_discord_text(
+                    message.channel,
+                    "I noted that change request. Reply `save` when you're ready to import, or keep editing.",
+                )
             return
 
         if await self._handle_start_day_message(message.channel, content):

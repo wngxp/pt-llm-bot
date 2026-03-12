@@ -79,6 +79,7 @@ CHECKIN_CHANNEL_ID=
 ASK_CHANNEL_ID=
 PRS_CHANNEL_ID=
 SETTINGS_CHANNEL_ID=
+CHANGELOG_CHANNEL_ID=
 WORKOUT_CHANNEL_IDS=111,222,333,444,555,666,777
 ```
 
@@ -92,7 +93,7 @@ python3 bot.py
 
 ## Commands
 
-- `!import <program text>` (in `#programme`)
+- `!import <program text>` (in `#programme`, now stages suggestions; reply `save` to import)
 - `!program`
 - `!startday <day name or day number>`
 - `!travel <description and optional duration>`
@@ -117,3 +118,4 @@ python3 bot.py
 - Core logging math (progression, e1RM, warm-up, plates) runs without LLM.
 - The database is initialized automatically on startup.
 - Utility commands work in any channel; workout interactions (`ready`, set logging, `skip rest`) stay restricted to workout channels.
+- On startup, the bot can post the latest changelog section to `#changelog` when a new version is detected.

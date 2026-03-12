@@ -63,7 +63,7 @@ class AskCog(commands.Cog):
             system=ASK_SYSTEM_PROMPT,
             user=json.dumps(prompt, ensure_ascii=False),
             temperature=0.3,
-            max_tokens=150,
+            max_tokens=300,
         )
 
     @commands.command(name="ask")

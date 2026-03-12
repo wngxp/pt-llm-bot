@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 
 
-BOT_VERSION = "0.2.3"
+BOT_VERSION = "0.3.0"
 
 
 class UtilityCog(commands.Cog):
