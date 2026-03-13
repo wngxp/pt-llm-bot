@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 REST_SECONDS_BY_CATEGORY = {
     "heavy_barbell": 240,
     "light_barbell": 150,
+    "smith_machine": 150,
     "dumbbell": 120,
     "cable_machine": 90,
     "bodyweight": 90,
@@ -1036,6 +1037,26 @@ class WorkoutCog(commands.Cog):
             f"Noted fatigue cue. Readiness adjusted to {next_readiness}/10 for upcoming suggestions."
         )
 
+    def _is_pr_announce_exercise(self, category: str, exercise_name: str) -> bool:
+        normalized_category = (category or "").strip().lower()
+        if normalized_category in {"heavy_barbell", "light_barbell", "smith_machine"}:
+            return True
+        if normalized_category != "bodyweight":
+            return False
+        lowered = exercise_name.lower()
+        compound_tokens = {
+            "pull-up",
+            "pull up",
+            "chin-up",
+            "chin up",
+            "dip",
+            "push-up",
+            "push up",
+            "inverted row",
+            "row",
+        }
+        return any(token in lowered for token in compound_tokens)
+
     async def _check_and_record_pr(
         self,
         session: WorkoutSession,
@@ -1057,7 +1078,15 @@ class WorkoutCog(commands.Cog):
         e1rm = epley_1rm(weight, reps)
         existing = await self.db.get_best_pr(exercise_name, user_id=user_id)
         existing_e1rm = float(existing.get("estimated_1rm") or 0.0) if existing else 0.0
+        is_new_pr_candidate = bool(existing is None or e1rm > existing_e1rm)
         prs_channel = self.bot.get_channel(self.settings.prs_channel_id) if self.settings.prs_channel_id else None
+        logger.info(
+            "PR check: exercise=%s, new_e1rm=%.2f, existing_best=%.2f, is_new_pr=%s",
+            exercise_name,
+            e1rm,
+            existing_e1rm,
+            is_new_pr_candidate,
+        )
         logger.info(
             "PR CHECK: exercise=%s, weight=%s, reps=%s, new_e1rm=%.2f",
             exercise_name,
@@ -1073,11 +1102,16 @@ class WorkoutCog(commands.Cog):
             e1rm,
             f"{existing_e1rm:.2f}" if existing else "None",
         )
-        announce_categories = {"heavy_barbell", "light_barbell", "bodyweight"}
+        if existing is None:
+            logger.info("PR CHECK: no existing personal_records row found for %s", exercise_name)
+        else:
+            logger.info("PR CHECK: existing personal_records row found for %s", exercise_name)
+
+        should_announce = self._is_pr_announce_exercise(category, exercise_name)
 
         if not existing:
             logger.info("PR baseline created for %s: %s %s x %s", exercise_name, weight, unit, reps)
-            await self.db.create_pr(
+            pr_id = await self.db.create_pr(
                 exercise_name,
                 user_id=user_id,
                 weight=weight,
@@ -1087,8 +1121,9 @@ class WorkoutCog(commands.Cog):
                 workout_date=date.today(),
                 workout_log_id=workout_log_id,
             )
+            logger.info("PR CHECK: personal_records insert success id=%s", pr_id)
             session.baseline_exercises.add(key)
-            if category in announce_categories:
+            if should_announce:
                 logger.info("PR CHECK: is_pr=True, pr_type=first")
                 payload = {
                     "exercise_name": exercise_name,
@@ -1143,7 +1178,7 @@ class WorkoutCog(commands.Cog):
             e1rm,
             prev_e1rm,
         )
-        await self.db.create_pr(
+        pr_id = await self.db.create_pr(
             exercise_name,
             user_id=user_id,
             weight=weight,
@@ -1153,8 +1188,9 @@ class WorkoutCog(commands.Cog):
             workout_date=date.today(),
             workout_log_id=workout_log_id,
         )
+        logger.info("PR CHECK: personal_records insert success id=%s", pr_id)
 
-        if category not in announce_categories:
+        if not should_announce:
             return None, None
 
         payload = {
@@ -1169,9 +1205,13 @@ class WorkoutCog(commands.Cog):
             "performer_user_id": str(performer_user_id or user_id or "").strip(),
         }
         self.bot.dispatch("pr_hit", payload)
+        prev_unit = str(existing.get("unit") or unit)
+        prev_date = str(existing.get("date") or "previous session")
         short_message = (
-            f"🏆 PR! {format_standard_number(weight)}{unit} x {reps} "
-            f"(e1RM: {format_standard_number(e1rm)})"
+            f"🏆 NEW PR! {exercise_name} {format_standard_number(weight)} {unit} x {reps} "
+            f"(e1RM: {format_standard_number(e1rm)}) - Previous: "
+            f"{format_standard_number(prev_weight)} {prev_unit} x {prev_reps} "
+            f"(e1RM: {format_standard_number(prev_e1rm)}) on {prev_date}"
         )
         return payload, short_message
 
@@ -1190,7 +1230,7 @@ class WorkoutCog(commands.Cog):
     ) -> Optional[str]:
         if weight <= 0:
             return None
-        announce_categories = {"heavy_barbell", "light_barbell", "bodyweight"}
+        should_announce = self._is_pr_announce_exercise(category, exercise_name)
         e1rm = epley_1rm(weight, reps)
         existing = await self.db.get_best_pr_excluding_log(
             exercise_name,
@@ -1203,9 +1243,16 @@ class WorkoutCog(commands.Cog):
             e1rm,
             f"{float(existing.get('estimated_1rm') or 0.0):.2f}" if existing else "None",
         )
+        logger.info(
+            "PR check: exercise=%s, new_e1rm=%.2f, existing_best=%s, is_new_pr=%s",
+            exercise_name,
+            e1rm,
+            f"{float(existing.get('estimated_1rm') or 0.0):.2f}" if existing else "None",
+            bool(existing is None or e1rm > float(existing.get("estimated_1rm") or 0.0)),
+        )
 
         if not existing:
-            await self.db.create_pr(
+            pr_id = await self.db.create_pr(
                 exercise_name,
                 user_id=user_id,
                 weight=weight,
@@ -1215,7 +1262,8 @@ class WorkoutCog(commands.Cog):
                 workout_date=date.today(),
                 workout_log_id=workout_log_id,
             )
-            if category in announce_categories:
+            logger.info("PR CHECK: personal_records insert success id=%s", pr_id)
+            if should_announce:
                 payload = {
                     "exercise_name": exercise_name,
                     "weight": weight,
@@ -1242,7 +1290,7 @@ class WorkoutCog(commands.Cog):
         if not is_pr:
             return None
 
-        await self.db.create_pr(
+        pr_id = await self.db.create_pr(
             exercise_name,
             user_id=user_id,
             weight=weight,
@@ -1252,7 +1300,8 @@ class WorkoutCog(commands.Cog):
             workout_date=date.today(),
             workout_log_id=workout_log_id,
         )
-        if category in announce_categories:
+        logger.info("PR CHECK: personal_records insert success id=%s", pr_id)
+        if should_announce:
             payload = {
                 "exercise_name": exercise_name,
                 "weight": weight,
@@ -1356,6 +1405,7 @@ class WorkoutCog(commands.Cog):
             rir=parsed.get("rir"),
             notes=note,
         )
+        logger.info("PR CHECK: workout_log insert success id=%s exercise=%s", log_id, str(target["name"]))
         session.set_counts[ex_id] = set_number
 
         pr_payload, short_pr = await self._check_and_record_pr(

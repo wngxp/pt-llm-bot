@@ -292,7 +292,7 @@ class Database:
 
     async def get_active_program(self, user_id: Optional[str | int] = None) -> Optional[dict[str, Any]]:
         normalized = self._normalize_user_id(user_id)
-        await self._revert_expired_temporary_program_if_needed(normalized)
+        await self.check_and_revert_expired_temporary_program(normalized)
         async with self.connect() as conn:
             await self._ensure_user_state(conn, normalized)
             row = await self._fetchone(conn, 
@@ -322,6 +322,50 @@ class Database:
                 await conn.commit()
                 return dict(row)
             return None
+
+    async def check_and_revert_expired_temporary_program(
+        self,
+        user_id: Optional[str | int] = None,
+    ) -> Optional[dict[str, Any]]:
+        normalized = self._normalize_user_id(user_id)
+        today = date.today().isoformat()
+        async with self.connect() as conn:
+            temporary = await self._fetchone(
+                conn,
+                """
+                SELECT *
+                FROM programs
+                WHERE active = 1 AND temporary = 1 AND expires_at IS NOT NULL AND expires_at <= ?
+                  AND user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (today, normalized),
+            )
+            if not temporary:
+                return None
+
+            parent_id = temporary["parent_program_id"]
+            parent = None
+            if parent_id:
+                parent = await self._fetchone(
+                    conn,
+                    "SELECT * FROM programs WHERE id = ?",
+                    (parent_id,),
+                )
+
+            await conn.execute("UPDATE programs SET active = 0 WHERE id = ?", (temporary["id"],))
+            if parent_id:
+                await conn.execute("UPDATE programs SET active = 1 WHERE id = ?", (parent_id,))
+                await conn.execute(
+                    "UPDATE user_state SET current_program_id = ? WHERE user_id = ?",
+                    (parent_id, normalized),
+                )
+            await conn.commit()
+            return {
+                "expired_program_name": str(temporary["name"]),
+                "parent_program_name": str(parent["name"]) if parent else None,
+            }
 
     async def _revert_expired_temporary_program_if_needed(self, user_id: Optional[str | int] = None) -> None:
         normalized = self._normalize_user_id(user_id)
@@ -616,31 +660,7 @@ class Database:
                 """,
                 (exercise_name, normalized),
             )
-            if row:
-                return dict(row)
-
-            fallback = await self._fetchone(
-                conn,
-                """
-                SELECT
-                    e.name AS exercise_name,
-                    wl.weight AS weight,
-                    wl.reps AS reps,
-                    wl.unit AS unit,
-                    (wl.weight * (1 + wl.reps / 30.0)) AS estimated_1rm,
-                    wl.date AS date
-                FROM workout_logs wl
-                JOIN exercises e ON e.id = wl.exercise_id
-                WHERE LOWER(e.name) = LOWER(?)
-                  AND wl.user_id = ?
-                ORDER BY estimated_1rm DESC, wl.date DESC
-                LIMIT 1
-                """,
-                (exercise_name, normalized),
-            )
-            if fallback:
-                return dict(fallback)
-        return None
+        return dict(row) if row else None
 
     async def create_pr(
         self,
@@ -707,33 +727,7 @@ class Database:
                 """,
                 (exercise_name, normalized, excluded_workout_log_id),
             )
-            if row:
-                return dict(row)
-
-            fallback = await self._fetchone(
-                conn,
-                """
-                SELECT
-                    e.name AS exercise_name,
-                    wl.weight AS weight,
-                    wl.reps AS reps,
-                    wl.unit AS unit,
-                    (wl.weight * (1 + wl.reps / 30.0)) AS estimated_1rm,
-                    wl.date AS date,
-                    wl.id AS workout_log_id
-                FROM workout_logs wl
-                JOIN exercises e ON e.id = wl.exercise_id
-                WHERE LOWER(e.name) = LOWER(?)
-                  AND wl.user_id = ?
-                  AND wl.id != ?
-                ORDER BY estimated_1rm DESC, wl.date DESC
-                LIMIT 1
-                """,
-                (exercise_name, normalized, excluded_workout_log_id),
-            )
-            if fallback:
-                return dict(fallback)
-        return None
+        return dict(row) if row else None
 
     async def get_recent_prs(self, days: int = 14, user_id: Optional[str | int] = None) -> list[dict[str, Any]]:
         normalized = self._normalize_user_id(user_id)
@@ -1295,6 +1289,57 @@ class Database:
             )
             await conn.commit()
             return int(cursor.rowcount or 0)
+
+    async def replace_exercise_in_active_program(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[str | int] = None,
+        day_name_hint: Optional[str] = None,
+        new_category: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        params: list[Any] = [int(program["id"]), old_name]
+        day_filter_sql = ""
+        if day_name_hint and day_name_hint.strip():
+            day_filter_sql = "AND LOWER(d.name) LIKE LOWER(?)"
+            params.append(f"%{day_name_hint.strip()}%")
+
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                f"""
+                SELECT e.id AS exercise_id, e.name AS exercise_name, e.category AS category, d.name AS day_name
+                FROM exercises e
+                JOIN program_days d ON d.id = e.program_day_id
+                WHERE d.program_id = ?
+                  AND LOWER(e.name) = LOWER(?)
+                  {day_filter_sql}
+                ORDER BY d.day_order, e.display_order
+                LIMIT 1
+                """,
+                tuple(params),
+            )
+            if not row:
+                return None
+
+            ex_id = int(row["exercise_id"])
+            next_category = str(new_category or row["category"] or "cable_machine")
+            await conn.execute(
+                "UPDATE exercises SET name = ?, category = ? WHERE id = ?",
+                (new_name, next_category, ex_id),
+            )
+            await conn.commit()
+            return {
+                "exercise_id": ex_id,
+                "old_name": str(row["exercise_name"]),
+                "new_name": new_name,
+                "day_name": str(row["day_name"]),
+                "category": next_category,
+            }
 
     async def rename_program_day_in_active_program(
         self,

@@ -13,6 +13,7 @@ Personal trainer Discord bot with SQLite + Ollama.
 - Activity logging in `#activity`
 - Weekly check-in summaries in `#check-in`
 - Free coaching Q&A in `#ask`
+- Dedicated coaching channel in `#coach` (opinionated programming advice and import handoff)
 - Volume, e1RM, plate calculator, streak tracking, CSV export
 
 ## Project Layout
@@ -25,6 +26,7 @@ cogs/
   activity.py
   checkin.py
   ask.py
+  coach.py
   prs.py
 db/
   database.py
@@ -77,6 +79,7 @@ PROGRAMME_CHANNEL_ID=
 ACTIVITY_CHANNEL_ID=
 CHECKIN_CHANNEL_ID=
 ASK_CHANNEL_ID=
+COACH_CHANNEL_ID=
 PRS_CHANNEL_ID=
 SETTINGS_CHANNEL_ID=
 CHANGELOG_CHANNEL_ID=
@@ -84,7 +87,7 @@ ADMIN_ROLE_ID=
 WORKOUT_CHANNEL_IDS=111,222,333,444,555,666,777
 ```
 
-If channel IDs are not set, the bot falls back to channel names (`programme`, `activity`, `check-in`, `ask`, `prs`, `settings`, and weekday names `mon..sun`).
+If channel IDs are not set, the bot falls back to channel names (`programme`, `activity`, `check-in`, `ask`, `coach`, `prs`, `settings`, and weekday names `mon..sun`).
 
 5. Run:
 
@@ -111,6 +114,7 @@ python3 bot.py
 - `!timezone [IANA tz name]` (global, example: `America/New_York`)
 - `!checkin`, `!summary` (check-in channel)
 - `!ask <question>`
+- `#coach`: ask for coaching/program design; say `import this` to hand off the latest generated plan to `#programme`
 - `!prs [days]`
 - Admin: `!debug`, `!setday <n>`, `!reset`, `!deleteprogram`
 - `!help`, `!version`

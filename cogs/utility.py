@@ -8,7 +8,7 @@ from discord.ext import commands
 from utils.discord_messages import send_discord_text
 
 
-BOT_VERSION = "0.5.0"
+BOT_VERSION = "0.6.0"
 
 
 class UtilityCog(commands.Cog):
@@ -185,6 +185,7 @@ class UtilityCog(commands.Cog):
             "**Info**",
             "- `!help` - show this command list",
             "- `!summary` / `!checkin` - weekly summary (in `#check-in`)",
+            "- `#coach` - opinionated coaching and program design (say `import this` to hand off to `#programme`)",
         ]
         await send_discord_text(ctx.channel, "\n".join(lines))
         await self._maybe_send_tip(ctx.channel)

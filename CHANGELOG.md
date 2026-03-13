@@ -1,3 +1,21 @@
+## [0.6.0] - 2026-03-13
+### Fixed
+- `#programme` now runs as a passive import flow by default: it echoes the pasted program by day, classifies exercise types, and asks for explicit `save`/edit confirmation.
+- Removed unsolicited rewrite/swap behavior in `#programme`; pending program edits now apply only explicit user commands (`swap`, `remove`, `add`, global smith conversion).
+- Program preview output is sent day-by-day and chunked at smaller size to avoid Discord cutoffs in long templates.
+- `save` flow now asks for program name first, imports, then asks start day; pending flow state is closed cleanly after import/day selection.
+- Travel/vacation flow now generates a temporary draft, supports follow-up equipment context, and saves as a temporary program with expiry and parent linkage.
+- Added expiry-revert notification in `#programme` when an expired temporary program is auto-reverted.
+- PR baseline bug fixed: PR comparison now uses `personal_records` only (no workout-log fallback), so first benchmark sets are correctly written and announced.
+- PR chain logging expanded with explicit comparison logs (`exercise`, `new_e1rm`, `existing_best`, `is_new_pr`) and insert success logs.
+- PR announcement scope updated for compounds: `heavy_barbell`, `light_barbell`, `smith_machine`, and bodyweight compounds only.
+- Startup now warns when no PR channel ID is configured.
+
+### Added
+- New `#coach` channel support (`COACH_CHANNEL_ID`) with a dedicated coaching persona and per-user/channel memory.
+- `#coach` supports `import this` handoff into the `#programme` save flow.
+- Config alias support for `PR_CHANNEL_ID` in addition to `PRS_CHANNEL_ID`.
+
 ## [0.5.0] - 2026-03-12
 ### Fixed
 - Travel/vacation edits in `#programme` now follow discuss -> confirm -> save and persist to the database as temporary programs (`temporary=1`, `parent_program_id`, `expires_at`).

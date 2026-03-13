@@ -53,6 +53,7 @@ class PTBot(commands.Bot):
             "cogs.activity",
             "cogs.checkin",
             "cogs.ask",
+            "cogs.coach",
             "cogs.prs",
             "cogs.utility",
         ]:
@@ -63,7 +64,7 @@ class PTBot(commands.Bot):
     async def _clear_runtime_cog_state_if_fresh_db(self) -> None:
         if await self.db.has_any_program():
             return
-        for cog_name in ("ProgrammeCog", "AskCog", "CheckInCog"):
+        for cog_name in ("ProgrammeCog", "AskCog", "CoachCog", "CheckInCog"):
             cog = self.get_cog(cog_name)
             if cog is None:
                 continue
@@ -86,6 +87,8 @@ class PTBot(commands.Bot):
         logging.info("Logged in as %s (%s)", self.user, getattr(self.user, "id", "?"))
         logging.info("PRS channel ID from config: %s", self.settings.prs_channel_id)
         logging.info("PRs cog loaded: %s", self.get_cog("PRsCog") is not None)
+        if not self.settings.prs_channel_id:
+            logging.warning("PR_CHANNEL_ID not configured — PR announcements will only appear in workout channels.")
         if self._startup_notified:
             return
         self._startup_notified = True

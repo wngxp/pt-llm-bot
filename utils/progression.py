@@ -29,7 +29,7 @@ def suggest_weight(
 
     if last_reps >= rep_high:
         category = exercise.get("category", "")
-        increment = 5.0 if category in {"heavy_barbell", "light_barbell", "dumbbell"} else 2.5
+        increment = 5.0 if category in {"heavy_barbell", "light_barbell", "smith_machine", "dumbbell"} else 2.5
         target = _adj(last_weight + increment)
         return f"Try {format_standard_number(target)}, aim for {rep_low}-{rep_high} reps."
 

@@ -22,6 +22,7 @@ class Settings:
     activity_channel_id: Optional[int]
     checkin_channel_id: Optional[int]
     ask_channel_id: Optional[int]
+    coach_channel_id: Optional[int]
     prs_channel_id: Optional[int]
     settings_channel_id: Optional[int]
     changelog_channel_id: Optional[int]
@@ -36,6 +37,14 @@ def _opt_int(name: str) -> Optional[int]:
     if value is None or value.strip() == "":
         return None
     return int(value)
+
+
+def _first_opt_int(*names: str) -> Optional[int]:
+    for name in names:
+        value = _opt_int(name)
+        if value is not None:
+            return value
+    return None
 
 
 
@@ -66,7 +75,8 @@ def load_settings() -> Settings:
         activity_channel_id=_opt_int("ACTIVITY_CHANNEL_ID"),
         checkin_channel_id=_opt_int("CHECKIN_CHANNEL_ID"),
         ask_channel_id=_opt_int("ASK_CHANNEL_ID"),
-        prs_channel_id=_opt_int("PRS_CHANNEL_ID"),
+        coach_channel_id=_opt_int("COACH_CHANNEL_ID"),
+        prs_channel_id=_first_opt_int("PRS_CHANNEL_ID", "PR_CHANNEL_ID"),
         settings_channel_id=_opt_int("SETTINGS_CHANNEL_ID"),
         changelog_channel_id=_opt_int("CHANGELOG_CHANNEL_ID"),
         admin_role_id=_opt_int("ADMIN_ROLE_ID"),

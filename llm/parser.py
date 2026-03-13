@@ -23,6 +23,17 @@ NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 KNOWN_CATEGORY_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
     (
         (
+            "smith machine",
+            "smith squat",
+            "smith bench",
+            "smith press",
+            "smith row",
+            "smith lunge",
+        ),
+        "smith_machine",
+    ),
+    (
+        (
             "romanian deadlift",
             "rdl",
             "pause squat",
@@ -89,7 +100,7 @@ KNOWN_CATEGORY_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
     ),
 ]
 
-VALID_CATEGORIES = {"heavy_barbell", "light_barbell", "dumbbell", "cable_machine", "bodyweight"}
+VALID_CATEGORIES = {"heavy_barbell", "light_barbell", "smith_machine", "dumbbell", "cable_machine", "bodyweight"}
 
 
 class ProgramParser:
