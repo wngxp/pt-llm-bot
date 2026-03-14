@@ -8,7 +8,7 @@ from discord.ext import commands
 from utils.discord_messages import send_discord_text
 
 
-BOT_VERSION = "0.6.0"
+BOT_VERSION = "0.6.1"
 
 
 class UtilityCog(commands.Cog):

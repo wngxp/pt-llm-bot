@@ -1,3 +1,17 @@
+## [0.6.1] - 2026-03-14
+### Fixed
+- `#programme` import/save flow now waits properly between `save` -> name -> start-day steps, with 60-second defaults instead of auto-advancing through multiple prompts at once.
+- `#programme` preview/edit flow now uses the LLM to parse pasted programs and apply requested edits while preserving the pasted structure and user-confirmed exercise types.
+- Imported exercise types are now stored on the exercise row and reused during workouts, preventing lifts like `Dumbbell Bench Press` from being re-labeled from name/category heuristics later.
+- PR announcements are now restricted to SBD lifts and direct barbell or Smith variations, while all exercises still continue writing e1RM history to `personal_records`.
+- First benchmark and PR callouts now include the e1RM consistently in both workout-channel and `#prs` announcements.
+- Discord text message splitting now enforces the real 2000-character limit globally before every send instead of using the old 4000-character threshold.
+
+### Added
+- Per-user program display IDs are now persisted in the database and shown in import/update/revert confirmations.
+- Startup changelog announcements now post the latest release section with a `latest changes` header, so version bumps are surfaced clearly in the changelog channel.
+- Regression coverage for stored equipment types, SBD-only PR announcement filtering, and Discord message splitting.
+
 ## [0.6.0] - 2026-03-13
 ### Fixed
 - `#programme` now runs as a passive import flow by default: it echoes the pasted program by day, classifies exercise types, and asks for explicit `save`/edit confirmation.

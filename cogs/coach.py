@@ -113,7 +113,8 @@ class CoachCog(commands.Cog):
 
         self.memory.append(user_id=message.author.id, channel_id=message.channel.id, role="user", content=content)
         try:
-            reply = (await self._answer(message, content)).strip()
+            async with message.channel.typing():
+                reply = (await self._answer(message, content)).strip()
         except Exception as exc:
             await send_discord_text(message.channel, f"Couldn't reach coach model: {exc}")
             return
@@ -125,4 +126,3 @@ class CoachCog(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(CoachCog(bot))
-

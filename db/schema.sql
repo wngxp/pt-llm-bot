@@ -3,6 +3,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS programs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
+    display_id INTEGER,
     name TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     active BOOLEAN DEFAULT 1,
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS exercises (
     rep_range_low INTEGER,
     rep_range_high INTEGER,
     category TEXT DEFAULT 'cable_machine',
+    equipment_type TEXT DEFAULT 'unknown',
     superset_group INTEGER,
     notes TEXT,
     muscle_groups TEXT,

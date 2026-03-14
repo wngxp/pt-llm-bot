@@ -15,9 +15,10 @@ def format_rep_target(low: Optional[int], high: Optional[int]) -> str:
 
 def format_exercise_brief(exercise: dict[str, Any]) -> str:
     target = format_rep_target(exercise.get("rep_range_low"), exercise.get("rep_range_high"))
+    exercise_type = str(exercise.get("equipment_type") or exercise.get("category", "cable_machine")).replace("_", " ")
     return (
         f"**{exercise['name']}** ({exercise['sets']} sets x {target})\n"
-        f"Category: {exercise.get('category', 'cable_machine').replace('_', ' ')}"
+        f"Type: {exercise_type}"
     )
 
 

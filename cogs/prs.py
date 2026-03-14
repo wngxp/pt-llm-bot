@@ -68,14 +68,15 @@ class PRsCog(commands.Cog):
             performer_prefix = ""
 
         if payload.get("is_first_benchmark"):
-            lines = [
+            await send_discord_text(
+                channel,
                 (
-                    f"📊 {performer_prefix}just logged their first {payload['exercise_name']}: "
-                    f"{format_standard_number(float(payload['weight']))} {payload['unit']} x {payload['reps']}"
+                    f"📊 {performer_prefix}just logged their first {payload['exercise_name']}! "
+                    f"{format_standard_number(float(payload['weight']))} {payload['unit']} x {payload['reps']} "
+                    f"(e1RM: {format_standard_number(float(payload['e1rm']))}) - this is their starting benchmark."
                 ),
-                f"(e1RM: {format_standard_number(float(payload['e1rm']))}) - this is their starting benchmark.",
-            ]
-            await send_discord_text(channel, "\n".join(lines))
+            )
+            logger.info("PR announcement sent to channel id=%s for first benchmark", channel.id)
             return
 
         previous = payload.get("previous")
@@ -97,6 +98,7 @@ class PRsCog(commands.Cog):
             lines.append(f"Improvement: {gain:+.1f} ({pct:+.1f}%)")
 
         await send_discord_text(channel, "\n".join(lines))
+        logger.info("PR announcement sent to channel id=%s for new PR", channel.id)
 
     @commands.command(name="prs")
     async def prs_command(self, ctx: commands.Context, days: int = 14) -> None:

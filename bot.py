@@ -146,7 +146,7 @@ class PTBot(commands.Bot):
             logging.warning("Changelog channel not found; skipping startup changelog post.")
             return
 
-        await send_discord_text(channel, f"PT-LLM Bot startup update\n\n{section}")
+        await send_discord_text(channel, f"PT-LLM Bot startup update: latest changes\n\n{section}")
         self._write_last_posted_version(version)
 
 

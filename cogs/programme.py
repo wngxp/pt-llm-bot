@@ -13,35 +13,24 @@ import discord
 from discord.ext import commands
 
 from llm.parser import ProgramParser
-from llm.prompts import FITNESS_ONLY_GUARDRAIL, PROGRAMME_IMPORT_SYSTEM_PROMPT
-from utils.conversation_memory import ConversationMemory
+from llm.prompts import PROGRAMME_EDIT_JSON_SYSTEM_PROMPT, PROGRAMME_IMPORT_SYSTEM_PROMPT
 from utils.discord_messages import send_discord_text, split_discord_message
 
 
 DURATION_RE = re.compile(r"(?P<num>\d+)\s*(?P<unit>day|days|week|weeks)", re.IGNORECASE)
 DAY_NUMBER_RE = re.compile(r"\bday\s*(?P<day_num>\d+)\b", re.IGNORECASE)
 START_DAY_INTENT_RE = re.compile(r"\b(start|begin|starting|start on|begin with)\b", re.IGNORECASE)
-EDIT_INTENT_RE = re.compile(r"\b(edit|swap|replace|change|modify)\b", re.IGNORECASE)
 SET_PATTERN_RE = re.compile(r"\d+\s*[xX×]\s*\d+")
-PENDING_CONFIRM_TOKENS = {"save", "confirm", "import", "looks good", "ship it", "yes"}
-PENDING_CANCEL_TOKENS = {"cancel", "stop", "never mind", "discard"}
 TRAVEL_INTENT_RE = re.compile(r"\b(travel|travelling|traveling|vacation|hotel gym|limited equipment)\b", re.IGNORECASE)
 BACK_INTENT_RE = re.compile(r"\b(i'?m back|im back|back from|returned|home now)\b", re.IGNORECASE)
 SWAP_RE = re.compile(
     r"(?:swap|replace)\s+(?P<old>.+?)\s+with\s+(?P<new>.+?)(?:\s+on\s+(?P<day>.+))?$",
     re.IGNORECASE,
 )
-REMOVE_RE = re.compile(r"(?:remove|delete)\s+(?P<name>.+?)(?:\s+from\s+(?P<day>.+))?$", re.IGNORECASE)
-ADD_RE = re.compile(
-    r"add\s+(?P<name>.+?)\s+to\s+(?P<day>.+?)(?:\s*[,;]\s*(?P<scheme>.+))?$",
-    re.IGNORECASE,
-)
-GLOBAL_SMITH_RE = re.compile(
-    r"(?:change|convert|swap|replace).*(?:all|every).*(?:barbell).*(?:smith machine|smith)",
-    re.IGNORECASE,
-)
-
-EXERCISE_TYPE_CHOICES = {"barbell", "dumbbell", "cable", "machine", "bodyweight", "smith machine", "unknown"}
+CHANGE_RE = re.compile(r"change\s+(.+?)\s+to\s+(.+)$", re.IGNORECASE)
+CONFIRM_TOKENS = {"save", "confirm", "import", "looks good", "ship it", "yes"}
+CANCEL_TOKENS = {"cancel", "stop", "never mind", "discard"}
+VALID_EQUIPMENT_TYPES = {"barbell", "dumbbell", "cable", "machine", "bodyweight", "smith machine", "unknown"}
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +40,25 @@ class PendingProgram:
     user_id: int
     channel_id: int
     raw_text: str
+    parsed_program: dict[str, Any]
     created_at: datetime
-    notes: list[str] = field(default_factory=list)
-    latest_suggestions: str = ""
     flow_id: str = field(default_factory=lambda: uuid4().hex)
     temporary: bool = False
     parent_program_id: Optional[int] = None
     expires_at: Optional[str] = None
+    stage: str = "review"
+    inferred_name: str = "Imported Program"
+
+
+@dataclass(slots=True)
+class PendingExerciseTypePrompt:
+    user_id: int
+    channel_id: int
+    old_name: str
+    new_name: str
+    day_hint: Optional[str]
+    created_at: datetime
+    fallback_type: str = "unknown"
 
 
 class ProgrammeCog(commands.Cog):
@@ -66,13 +67,23 @@ class ProgrammeCog(commands.Cog):
         self.settings = bot.settings
         self.db = bot.db
         self.parser = ProgramParser(bot.ollama)
-        self.post_import_state: dict[int, dict[str, Any]] = {}
         self.pending_programs: dict[tuple[int, int], PendingProgram] = {}
-        self.review_tasks: dict[tuple[int, int], asyncio.Task[list[str]]] = {}
-        self.closed_flows: dict[tuple[int, int], tuple[str, datetime]] = {}
-        self.user_locks: dict[int, asyncio.Lock] = {}
+        self.post_import_state: dict[int, dict[str, Any]] = {}
         self.pending_travel_context: dict[int, tuple[str, datetime]] = {}
-        self.memory = ConversationMemory(max_messages=10, ttl_minutes=30)
+        self.pending_exercise_type_prompts: dict[tuple[int, int], PendingExerciseTypePrompt] = {}
+        self.user_locks: dict[int, asyncio.Lock] = {}
+        self.flow_timeout_tasks: dict[tuple[int, int, str], asyncio.Task[None]] = {}
+
+    def clear_runtime_state(self) -> None:
+        for task in self.flow_timeout_tasks.values():
+            if not task.done():
+                task.cancel()
+        self.flow_timeout_tasks.clear()
+        self.pending_programs.clear()
+        self.post_import_state.clear()
+        self.pending_travel_context.clear()
+        self.pending_exercise_type_prompts.clear()
+        self.user_locks.clear()
 
     def _get_user_lock(self, user_id: int) -> asyncio.Lock:
         lock = self.user_locks.get(user_id)
@@ -81,6 +92,21 @@ class ProgrammeCog(commands.Cog):
             self.user_locks[user_id] = lock
         return lock
 
+    def _pending_key(self, user_id: int, channel_id: int) -> tuple[int, int]:
+        return (int(user_id), int(channel_id))
+
+    def _timeout_key(self, user_id: int, channel_id: int, kind: str) -> tuple[int, int, str]:
+        return (int(user_id), int(channel_id), kind)
+
+    def _cancel_timeout(self, user_id: int, channel_id: int, kind: str) -> None:
+        task = self.flow_timeout_tasks.pop(self._timeout_key(user_id, channel_id, kind), None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_timeout(self, user_id: int, channel_id: int, kind: str, task: asyncio.Task[None]) -> None:
+        self._cancel_timeout(user_id, channel_id, kind)
+        self.flow_timeout_tasks[self._timeout_key(user_id, channel_id, kind)] = task
+
     def _is_programme_channel(self, channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel) -> bool:
         cid = getattr(channel, "id", None)
         name = getattr(channel, "name", "")
@@ -88,11 +114,25 @@ class ProgrammeCog(commands.Cog):
             return cid == self.settings.programme_channel_id or name == "programme"
         return name == "programme"
 
-    def _is_placeholder_name(self, name: str) -> bool:
-        cleaned = name.strip().lower()
-        if not cleaned:
-            return True
-        return cleaned in {"unnamed", "unnamed program", "untitled", "untitled program", "imported program"}
+    def _now_utc(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _normalize_name(self, text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+    def _normalize_equipment_type(self, label: str) -> str:
+        lowered = " ".join((label or "").strip().lower().split())
+        if not lowered:
+            return "unknown"
+        if lowered in VALID_EQUIPMENT_TYPES:
+            return lowered
+        aliases = {
+            "smith": "smith machine",
+            "bw": "bodyweight",
+            "body weight": "bodyweight",
+            "db": "dumbbell",
+        }
+        return aliases.get(lowered, "unknown")
 
     def _infer_program_name_from_text(self, raw_text: str) -> str | None:
         patterns = [
@@ -106,18 +146,266 @@ class ProgrammeCog(commands.Cog):
                 return match.group("name").strip()
         return None
 
-    def _now_utc(self) -> datetime:
-        return datetime.now(timezone.utc)
+    def _looks_like_program_paste(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        if len((text or "").splitlines()) < 2:
+            return False
+        if len(SET_PATTERN_RE.findall(text or "")) < 2:
+            return False
+        return any(token in lowered for token in ["day ", "push", "pull", "legs", "upper", "lower"])
 
-    def _set_post_import_context(self, user_id: int, channel_id: int, program_id: int) -> None:
+    def _exercise_type_from_name_and_category(self, exercise_name: str, category: str = "") -> str:
+        lowered = exercise_name.lower()
+        normalized_category = (category or "").strip().lower()
+        if "smith" in lowered or normalized_category == "smith_machine":
+            return "smith machine"
+        if any(token in lowered for token in ("pull-up", "pull up", "chin-up", "chin up", "push-up", "push up", "dip")):
+            return "bodyweight"
+        if normalized_category == "bodyweight":
+            return "bodyweight"
+        if any(token in lowered for token in ("dumbbell", "db ", "db-")) or normalized_category == "dumbbell":
+            return "dumbbell"
+        if any(token in lowered for token in ("cable", "press-around", "press around", "face pull")):
+            return "cable"
+        if any(token in lowered for token in ("machine", "pulldown", "lat pulldown", "leg press", "leg curl", "leg extension", "hack squat")):
+            return "machine"
+        if normalized_category in {"heavy_barbell", "light_barbell"}:
+            return "barbell"
+        return "unknown"
+
+    def _db_category_from_equipment_type(self, exercise_name: str, equipment_type: str, fallback: str = "") -> str:
+        normalized_type = self._normalize_equipment_type(equipment_type)
+        normalized_fallback = (fallback or "").strip().lower()
+        if normalized_type == "smith machine":
+            return "smith_machine"
+        if normalized_type == "dumbbell":
+            return "dumbbell"
+        if normalized_type == "bodyweight":
+            return "bodyweight"
+        if normalized_type in {"cable", "machine", "unknown"}:
+            return "cable_machine"
+        if normalized_fallback in {"heavy_barbell", "light_barbell"}:
+            return normalized_fallback
+        looked_up = self.parser._category_lookup(exercise_name, fallback=normalized_fallback)
+        if looked_up in {"heavy_barbell", "light_barbell"}:
+            return looked_up
+        heavy_tokens = ("squat", "bench", "deadlift", "overhead press", "ohp", "barbell row")
+        return "heavy_barbell" if any(token in exercise_name.lower() for token in heavy_tokens) else "light_barbell"
+
+    def _normalize_program_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        fallback_name: str = "Imported Program",
+    ) -> dict[str, Any]:
+        days_in = payload.get("days") if isinstance(payload, dict) else []
+        if not isinstance(days_in, list) or not days_in:
+            raise ValueError("No days found in parsed program")
+
+        out_days: list[dict[str, Any]] = []
+        for day_idx, day in enumerate(days_in):
+            if not isinstance(day, dict):
+                continue
+            exercises_in = day.get("exercises")
+            if not isinstance(exercises_in, list):
+                exercises_in = []
+            out_exercises: list[dict[str, Any]] = []
+            for ex_idx, exercise in enumerate(exercises_in):
+                if not isinstance(exercise, dict):
+                    continue
+                name = str(exercise.get("name") or "").strip()
+                if not name:
+                    continue
+                equipment_type = self._normalize_equipment_type(
+                    str(exercise.get("equipment_type") or self._exercise_type_from_name_and_category(name, str(exercise.get("category") or "")))
+                )
+                category = self._db_category_from_equipment_type(
+                    name,
+                    equipment_type,
+                    fallback=str(exercise.get("category") or ""),
+                )
+                out_exercises.append(
+                    {
+                        "name": name,
+                        "display_order": ex_idx,
+                        "sets": max(1, int(exercise.get("sets") or 1)),
+                        "rep_range_low": self._int_or_none(exercise.get("rep_range_low")),
+                        "rep_range_high": self._int_or_none(exercise.get("rep_range_high")),
+                        "category": category,
+                        "equipment_type": equipment_type,
+                        "superset_group": self._int_or_none(exercise.get("superset_group")),
+                        "muscle_groups": str(exercise.get("muscle_groups") or "").strip(),
+                        "notes": str(exercise.get("notes") or "").strip(),
+                    }
+                )
+            out_days.append(
+                {
+                    "day_order": day_idx,
+                    "name": str(day.get("name") or f"Day {day_idx + 1}").strip() or f"Day {day_idx + 1}",
+                    "exercises": out_exercises,
+                }
+            )
+
+        if not out_days:
+            raise ValueError("No days found in parsed program")
+        return {
+            "program_name": str(payload.get("program_name") or fallback_name).strip() or fallback_name,
+            "days": out_days,
+        }
+
+    def _int_or_none(self, value: Any) -> Optional[int]:
+        if value in {None, "", "null"}:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _format_rep_scheme(self, exercise: dict[str, Any]) -> str:
+        sets = int(exercise.get("sets") or 1)
+        low = exercise.get("rep_range_low")
+        high = exercise.get("rep_range_high")
+        notes = str(exercise.get("notes") or "").strip()
+        if low is not None and high is not None:
+            if int(low) == int(high):
+                return f"{sets}×{int(low)}"
+            return f"{sets}×{int(low)}–{int(high)}"
+        if "amrap" in notes.lower():
+            return f"{sets}×AMRAP"
+        return f"{sets}×?"
+
+    def _program_to_text(self, parsed_program: dict[str, Any]) -> str:
+        lines: list[str] = []
+        for day in parsed_program.get("days", []):
+            lines.append(str(day.get("name") or "Day"))
+            for exercise in day.get("exercises", []):
+                lines.append(f"{exercise['name']} - {self._format_rep_scheme(exercise)}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _unknown_exercises(self, parsed_program: dict[str, Any]) -> list[dict[str, str]]:
+        unknowns: list[dict[str, str]] = []
+        for day in parsed_program.get("days", []):
+            day_name = str(day.get("name") or "Day")
+            for exercise in day.get("exercises", []):
+                if self._normalize_equipment_type(str(exercise.get("equipment_type") or "")) != "unknown":
+                    continue
+                unknowns.append({"day_name": day_name, "exercise_name": str(exercise.get("name") or "")})
+        return unknowns
+
+    async def _send_program_preview(
+        self,
+        channel: discord.abc.Messageable,
+        parsed_program: dict[str, Any],
+        *,
+        include_footer: bool = True,
+    ) -> None:
+        days = parsed_program.get("days", [])
+        if not days:
+            await send_discord_text(channel, "I couldn't break that into days yet. Re-send it with the day headers kept in place and I'll try again.")
+            return
+
+        await send_discord_text(channel, "Here's your program:")
+        for idx, day in enumerate(days):
+            day_name = str(day.get("name") or f"Day {idx + 1}").strip() or f"Day {idx + 1}"
+            day_label = day_name if day_name.lower().startswith("day ") else f"Day {idx + 1} - {day_name}"
+            lines = [f"{day_label}:"]
+            for ex_idx, exercise in enumerate(day.get("exercises", []), start=1):
+                ex_name = str(exercise.get("name") or "").strip()
+                if not ex_name:
+                    continue
+                equipment_type = self._normalize_equipment_type(str(exercise.get("equipment_type") or "unknown"))
+                lines.append(f"  {ex_idx}. {ex_name} ({equipment_type}) — {self._format_rep_scheme(exercise)}")
+            for chunk in split_discord_message("\n".join(lines), limit=1800):
+                await send_discord_text(channel, chunk)
+
+        if not include_footer:
+            return
+
+        unknowns = self._unknown_exercises(parsed_program)
+        if unknowns:
+            names = ", ".join(item["exercise_name"] for item in unknowns[:6])
+            await send_discord_text(
+                channel,
+                f"I marked {len(unknowns)} exercise type(s) as `(unknown)` ({names}). Reply with the correct types if you want them fixed before import.",
+            )
+        await send_discord_text(
+            channel,
+            "Are you happy to proceed? Reply with `save` to import, or describe any edits you'd like.",
+        )
+
+    async def _parse_program_preview(self, channel: discord.abc.Messageable, raw_text: str) -> dict[str, Any]:
+        async with channel.typing():
+            parsed = await self.parser.parse_program(raw_text)
+        inferred_name = self._infer_program_name_from_text(raw_text) or str(parsed.get("program_name") or "Imported Program")
+        normalized = self._normalize_program_payload(parsed, fallback_name=inferred_name)
+        if not normalized.get("days"):
+            raise ValueError("No days found in parsed program")
+        return normalized
+
+    async def _apply_pending_edit_with_llm(
+        self,
+        channel: discord.abc.Messageable,
+        state: PendingProgram,
+        user_message: str,
+    ) -> tuple[str, str, Optional[dict[str, Any]]]:
+        payload = {
+            "program": state.parsed_program,
+            "user_message": user_message,
+            "unknown_exercises": self._unknown_exercises(state.parsed_program),
+        }
+        async with channel.typing():
+            response = await self.bot.ollama.chat_json(
+                system=PROGRAMME_EDIT_JSON_SYSTEM_PROMPT,
+                user=json.dumps(payload, ensure_ascii=False),
+                temperature=0.0,
+                max_tokens=1600,
+            )
+        status = str(response.get("status") or "no_change").strip().lower()
+        message = str(response.get("message") or "").strip()
+        if status != "updated":
+            return status, message, None
+        program_payload = response.get("program")
+        if not isinstance(program_payload, dict):
+            raise ValueError("Updated program payload missing from LLM response")
+        updated = self._normalize_program_payload(
+            program_payload,
+            fallback_name=str(state.parsed_program.get("program_name") or state.inferred_name),
+        )
+        return status, message, updated
+
+    def _extract_travel_expiry(self, text: str) -> Optional[str]:
+        match = DURATION_RE.search(text or "")
+        if not match:
+            return None
+        num = int(match.group("num"))
+        unit = str(match.group("unit") or "").lower()
+        days = num * 7 if "week" in unit else num
+        return (date.today() + timedelta(days=max(1, days))).isoformat()
+
+    def _set_pending_program(self, state: PendingProgram) -> None:
+        self.pending_programs[self._pending_key(state.user_id, state.channel_id)] = state
+
+    def _get_pending_program(self, user_id: int, channel_id: int) -> Optional[PendingProgram]:
+        pending = self.pending_programs.get(self._pending_key(user_id, channel_id))
+        if not pending:
+            return None
+        if pending.created_at + timedelta(minutes=30) < self._now_utc():
+            self.pending_programs.pop(self._pending_key(user_id, channel_id), None)
+            return None
+        return pending
+
+    def _clear_pending_program(self, user_id: int, channel_id: int) -> None:
+        self.pending_programs.pop(self._pending_key(user_id, channel_id), None)
+        self._cancel_timeout(user_id, channel_id, "name")
+
+    def _set_post_import_context(self, user_id: int, channel_id: int, program_id: int, display_id: int) -> None:
         self.post_import_state[user_id] = {
             "program_id": program_id,
+            "display_id": display_id,
             "channel_id": channel_id,
             "expires_at": self._now_utc() + timedelta(minutes=5),
         }
-
-    def _clear_post_import_context(self, user_id: int) -> None:
-        self.post_import_state.pop(user_id, None)
 
     def _get_post_import_context(self, user_id: int, channel_id: int) -> Optional[dict[str, Any]]:
         state = self.post_import_state.get(user_id)
@@ -127,429 +415,22 @@ class ProgrammeCog(commands.Cog):
             return None
         expires_at = state.get("expires_at")
         if not isinstance(expires_at, datetime) or expires_at < self._now_utc():
-            self._clear_post_import_context(user_id)
+            self._clear_post_import_context(user_id, channel_id)
             return None
         return state
 
-    def _looks_like_program_paste(self, text: str) -> bool:
-        lowered = text.lower()
-        if len(text.splitlines()) < 2:
-            return False
-        if len(SET_PATTERN_RE.findall(text)) < 2:
-            return False
-        day_markers = any(token in lowered for token in ["day ", "push", "pull", "legs", "upper", "lower"])
-        return day_markers
+    def _clear_post_import_context(self, user_id: int, channel_id: int) -> None:
+        self.post_import_state.pop(user_id, None)
+        self._cancel_timeout(user_id, channel_id, "day")
 
-    def _normalize_name(self, text: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", text.lower())
+    def _clear_pending_exercise_type_prompt(self, user_id: int, channel_id: int) -> None:
+        self.pending_exercise_type_prompts.pop(self._pending_key(user_id, channel_id), None)
 
-    def _parse_start_day_index(self, text: str, days: list[dict[str, Any]]) -> Optional[int]:
-        plain_num = re.fullmatch(r"\s*(\d+)\s*", text)
-        if plain_num:
-            idx = int(plain_num.group(1)) - 1
-            if 0 <= idx < len(days):
-                return idx
-
-        match = DAY_NUMBER_RE.search(text)
-        if match:
-            idx = int(match.group("day_num")) - 1
-            if 0 <= idx < len(days):
-                return idx
-
-        lowered = text.lower()
-        for day in days:
-            day_name = str(day.get("name") or "").strip()
-            if day_name and day_name.lower() in lowered:
-                return int(day["day_order"])
-
-        normalized_text = self._normalize_name(text)
-        for day in days:
-            day_name = self._normalize_name(str(day.get("name") or ""))
-            if day_name and day_name in normalized_text:
-                return int(day["day_order"])
-
-        return None
-
-    def _pending_key(self, user_id: int, channel_id: int) -> tuple[int, int]:
-        return (int(user_id), int(channel_id))
-
-    def _get_pending_program(self, user_id: int, channel_id: int) -> Optional[PendingProgram]:
-        key = self._pending_key(user_id, channel_id)
-        state = self.pending_programs.get(key)
-        if not state:
-            return None
-        if state.created_at + timedelta(minutes=30) < self._now_utc():
-            self.pending_programs.pop(key, None)
-            return None
-        return state
-
-    def _set_pending_program(self, state: PendingProgram) -> None:
-        key = self._pending_key(state.user_id, state.channel_id)
-        self.pending_programs[key] = state
-        closed = self.closed_flows.get(key)
-        if closed and closed[0] == state.flow_id:
-            self.closed_flows.pop(key, None)
-
-    def _clear_pending_program(self, user_id: int, channel_id: int) -> None:
-        self.pending_programs.pop(self._pending_key(user_id, channel_id), None)
-
-    def _is_flow_closed(self, user_id: int, channel_id: int, flow_id: str) -> bool:
-        key = self._pending_key(user_id, channel_id)
-        record = self.closed_flows.get(key)
-        if not record:
-            return False
-        closed_flow, expires_at = record
-        if expires_at < self._now_utc():
-            self.closed_flows.pop(key, None)
-            return False
-        return closed_flow == flow_id
-
-    def _mark_flow_closed(self, user_id: int, channel_id: int, flow_id: str) -> None:
-        self.closed_flows[self._pending_key(user_id, channel_id)] = (
-            flow_id,
-            self._now_utc() + timedelta(minutes=10),
-        )
-
-    def _is_pending_flow_active(self, state: PendingProgram) -> bool:
-        if self._is_flow_closed(state.user_id, state.channel_id, state.flow_id):
-            return False
-        current = self._get_pending_program(state.user_id, state.channel_id)
-        if not current:
-            return False
-        return current.flow_id == state.flow_id
-
-    def _cancel_review_task(self, user_id: int, channel_id: int) -> None:
-        key = self._pending_key(user_id, channel_id)
-        task = self.review_tasks.pop(key, None)
-        if task and not task.done():
-            task.cancel()
-
-    def _extract_exercise_summary(self, raw_text: str) -> list[dict[str, Any]]:
-        blocks = self.parser._extract_day_blocks(raw_text)
-        summary: list[dict[str, Any]] = []
-        for block in blocks:
-            day_name = str(block.get("name") or "Day")
-            for ex in block.get("exercises", []):
-                name = str(ex.get("name") or "").strip()
-                if not name:
-                    continue
-                summary.append(
-                    {
-                        "day": day_name,
-                        "name": name,
-                        "sets": ex.get("sets"),
-                        "rep_range_low": ex.get("rep_range_low"),
-                        "rep_range_high": ex.get("rep_range_high"),
-                        "notes": ex.get("notes") or "",
-                        "category": self.parser._category_lookup(name),
-                    }
-                )
-        return summary
-
-    async def _program_to_text(self, program_id: int) -> str:
-        days = await self.db.get_program_days(program_id)
-        lines: list[str] = []
-        for day in days:
-            lines.append(str(day.get("name") or f"Day {int(day.get('day_order', 0)) + 1}"))
-            exercises = await self.db.get_exercises_for_day(int(day["id"]))
-            for ex in exercises:
-                sets = int(ex.get("sets") or 1)
-                low = ex.get("rep_range_low")
-                high = ex.get("rep_range_high")
-                notes = str(ex.get("notes") or "").strip()
-                if low is None or high is None:
-                    scheme = "AMRAP" if not notes else f"({notes})"
-                elif int(low) == int(high):
-                    scheme = str(int(low))
-                else:
-                    scheme = f"{int(low)}-{int(high)}"
-                lines.append(f"{ex['name']} - {sets}x{scheme}")
-            lines.append("")
-        return "\n".join(lines).strip()
-
-    def _extract_travel_expiry(self, text: str) -> Optional[str]:
-        match = DURATION_RE.search(text or "")
-        if not match:
-            return None
-        num = int(match.group("num"))
-        unit = str(match.group("unit") or "").lower()
-        days = num * 7 if "week" in unit else num
-        days = max(1, days)
-        return (date.today() + timedelta(days=days)).isoformat()
-
-    def _exercise_type_label(self, exercise_name: str, *, category: str = "") -> str:
-        lowered = exercise_name.lower()
-        if "smith" in lowered:
-            return "smith machine"
-        if any(token in lowered for token in {"pull-up", "pull up", "chin-up", "chin up", "push-up", "push up", "dip", "bodyweight", "bw"}):
-            return "bodyweight"
-        if any(token in lowered for token in {"dumbbell", "db ", "db-"}):
-            return "dumbbell"
-        if "cable" in lowered:
-            return "cable"
-        if any(token in lowered for token in {"machine", "pressdown", "pulldown", "leg curl", "leg extension", "hack squat"}):
-            return "machine"
-        if any(token in lowered for token in {"barbell", "ez-bar", "ez bar"}):
-            return "barbell"
-
-        cat = (category or "").strip().lower()
-        if cat in {"heavy_barbell", "light_barbell"}:
-            return "barbell"
-        if cat == "smith_machine":
-            return "smith machine"
-        if cat == "dumbbell":
-            return "dumbbell"
-        if cat == "bodyweight":
-            return "bodyweight"
-        if cat == "cable_machine":
-            if any(token in lowered for token in {"machine", "press", "curl", "extension"}):
-                return "machine"
-            if "cable" in lowered or "pulldown" in lowered or "face pull" in lowered:
-                return "cable"
-            return "unknown"
-        return "unknown"
-
-    def _format_rep_scheme(self, ex: dict[str, Any]) -> str:
-        sets = int(ex.get("sets") or 1)
-        low = ex.get("rep_range_low")
-        high = ex.get("rep_range_high")
-        notes = str(ex.get("notes") or "").strip()
-        if low is not None and high is not None:
-            if int(low) == int(high):
-                return f"{sets}x{int(low)}"
-            return f"{sets}x{int(low)}-{int(high)}"
-        if "amrap" in notes.lower():
-            return f"{sets}xAMRAP"
-        if notes:
-            normalized = notes.replace("varying reps:", "").replace("special rep scheme:", "").strip(" ;")
-            if normalized:
-                return f"{sets}x({normalized})"
-        return f"{sets}x?"
-
-    def _blocks_to_program_text(self, blocks: list[dict[str, Any]]) -> str:
-        lines: list[str] = []
-        for day in blocks:
-            day_name = str(day.get("name") or "").strip() or "Day"
-            lines.append(day_name)
-            for ex in day.get("exercises", []):
-                name = str(ex.get("name") or "").strip()
-                if not name:
-                    continue
-                lines.append(f"{name} - {self._format_rep_scheme(ex)}")
-            lines.append("")
-        return "\n".join(lines).strip()
-
-    async def _send_program_preview(
-        self,
-        channel: discord.abc.Messageable,
-        raw_text: str,
-        *,
-        include_footer: bool = True,
-    ) -> None:
-        blocks = self.parser._extract_day_blocks(raw_text)
-        if not blocks:
-            await send_discord_text(channel, "I couldn't parse day/exercise lines from that program yet.")
-            return
-
-        await send_discord_text(channel, "Here's your program:")
-        unknown_count = 0
-        for idx, day in enumerate(blocks):
-            day_title = str(day.get("name") or f"Day {idx + 1}").strip() or f"Day {idx + 1}"
-            if day_title.lower().startswith("day "):
-                lines = [f"{day_title}:"]
-            else:
-                lines = [f"Day {idx + 1} - {day_title}:"]
-            for ex_idx, ex in enumerate(day.get("exercises", []), start=1):
-                name = str(ex.get("name") or "").strip()
-                if not name:
-                    continue
-                category = self.parser._category_lookup(name)
-                ex_type = self._exercise_type_label(name, category=category)
-                if ex_type == "unknown":
-                    unknown_count += 1
-                scheme = self._format_rep_scheme(ex)
-                lines.append(f"  {ex_idx}. {name} ({ex_type}) - {scheme}")
-            message = "\n".join(lines)
-            for chunk in split_discord_message(message, limit=1800):
-                await send_discord_text(channel, chunk)
-
-        if include_footer:
-            if unknown_count:
-                await send_discord_text(
-                    channel,
-                    f"I marked {unknown_count} exercise type(s) as `(unknown)`. "
-                    "Tell me the correct type if you want them set before import.",
-                )
-            await send_discord_text(
-                channel,
-                "Are you happy to proceed? Reply with `save` to import, or describe any edits you'd like.",
-            )
-
-    def _find_day_index(self, blocks: list[dict[str, Any]], day_hint: str) -> Optional[int]:
-        hint = day_hint.strip().lower()
-        if not hint:
-            return None
-        match = re.search(r"\bday\s*(\d+)\b", hint)
-        if match:
-            idx = int(match.group(1)) - 1
-            if 0 <= idx < len(blocks):
-                return idx
-        if hint.isdigit():
-            idx = int(hint) - 1
-            if 0 <= idx < len(blocks):
-                return idx
-        normalized_hint = self._normalize_name(hint)
-        for idx, day in enumerate(blocks):
-            day_name = str(day.get("name") or "")
-            norm_day = self._normalize_name(day_name)
-            if normalized_hint and (normalized_hint in norm_day or norm_day in normalized_hint):
-                return idx
-        return None
-
-    def _find_exercise_index(
-        self,
-        blocks: list[dict[str, Any]],
-        exercise_name: str,
-        *,
-        day_idx: Optional[int] = None,
-    ) -> tuple[Optional[int], Optional[int]]:
-        target = self._normalize_name(exercise_name)
-        if not target:
-            return None, None
-        search_days = [day_idx] if day_idx is not None else list(range(len(blocks)))
-        for idx in search_days:
-            if idx is None or idx < 0 or idx >= len(blocks):
-                continue
-            exercises = blocks[idx].get("exercises", [])
-            for ex_idx, ex in enumerate(exercises):
-                name = self._normalize_name(str(ex.get("name") or ""))
-                if target == name or (target and target in name) or (name and name in target):
-                    return idx, ex_idx
-        return None, None
-
-    def _parse_scheme_to_exercise(self, exercise_name: str, scheme: str) -> Optional[dict[str, Any]]:
-        parsed = self.parser._parse_exercise_line(f"{exercise_name} - {scheme}")
-        return parsed
-
-    def _apply_edit_to_blocks(self, blocks: list[dict[str, Any]], text: str) -> tuple[bool, str]:
-        lowered = text.lower().strip()
-        if not blocks:
-            return False, "No pending program loaded."
-
-        if GLOBAL_SMITH_RE.search(lowered) or ("no barbell" in lowered and "smith" in lowered):
-            changed = 0
-            for day in blocks:
-                for ex in day.get("exercises", []):
-                    name = str(ex.get("name") or "").strip()
-                    if not name:
-                        continue
-                    category = self.parser._category_lookup(name)
-                    if category not in {"heavy_barbell", "light_barbell"}:
-                        continue
-                    if name.lower().startswith("smith machine "):
-                        continue
-                    ex["name"] = f"Smith Machine {name}"
-                    changed += 1
-            if changed == 0:
-                return False, "No barbell exercises found to convert."
-            return True, f"Applied Smith Machine conversion to {changed} barbell exercises."
-
-        swap = SWAP_RE.search(text)
-        if swap:
-            old_name = str(swap.group("old") or "").strip(" .")
-            new_name = str(swap.group("new") or "").strip(" .")
-            day_hint = str(swap.group("day") or "").strip()
-            day_idx = self._find_day_index(blocks, day_hint) if day_hint else None
-            found_day_idx, found_ex_idx = self._find_exercise_index(blocks, old_name, day_idx=day_idx)
-            if found_day_idx is None or found_ex_idx is None:
-                return False, f"I couldn't find `{old_name}` in the pending program."
-            blocks[found_day_idx]["exercises"][found_ex_idx]["name"] = new_name
-            day_name = str(blocks[found_day_idx].get("name") or f"Day {found_day_idx + 1}")
-            return True, f"Replaced {old_name} with {new_name} on {day_name}."
-
-        remove = REMOVE_RE.search(text)
-        if remove:
-            ex_name = str(remove.group("name") or "").strip(" .")
-            day_hint = str(remove.group("day") or "").strip()
-            day_idx = self._find_day_index(blocks, day_hint) if day_hint else None
-            found_day_idx, found_ex_idx = self._find_exercise_index(blocks, ex_name, day_idx=day_idx)
-            if found_day_idx is None or found_ex_idx is None:
-                return False, f"I couldn't find `{ex_name}` in the pending program."
-            day_name = str(blocks[found_day_idx].get("name") or f"Day {found_day_idx + 1}")
-            removed = blocks[found_day_idx]["exercises"].pop(found_ex_idx)
-            return True, f"Removed {removed.get('name', ex_name)} from {day_name}."
-
-        add = ADD_RE.search(text)
-        if add:
-            ex_name = str(add.group("name") or "").strip(" .")
-            day_hint = str(add.group("day") or "").strip(" .")
-            scheme = str(add.group("scheme") or "").strip(" .")
-            day_idx = self._find_day_index(blocks, day_hint)
-            if day_idx is None:
-                return False, "I couldn't map that to a day. Try `add Face Pulls to Pull day, 3x15`."
-            if not scheme:
-                return False, "Please include sets x reps (example: `add Face Pulls to Pull day, 3x15`)."
-            parsed = self._parse_scheme_to_exercise(ex_name, scheme)
-            if not parsed:
-                return False, "I couldn't parse that rep scheme. Use format like `3x15` or `3x8-10`."
-            blocks[day_idx].setdefault("exercises", []).append(parsed)
-            day_name = str(blocks[day_idx].get("name") or f"Day {day_idx + 1}")
-            return True, f"Added {ex_name} ({self._format_rep_scheme(parsed)}) to {day_name}."
-
-        return False, "I can apply edits like `swap X with Y`, `remove X`, or `add X to Day Y, 3x15`."
-
-    def _build_payload_from_raw_text(self, raw_text: str, program_name: str) -> dict[str, Any]:
-        blocks = self.parser._extract_day_blocks(raw_text)
-        if not blocks:
-            raise ValueError("Unable to parse day blocks from program text.")
-        days: list[dict[str, Any]] = []
-        for day_idx, block in enumerate(blocks):
-            exercises: list[dict[str, Any]] = []
-            for ex_idx, ex in enumerate(block.get("exercises", [])):
-                name = str(ex.get("name") or "").strip()
-                if not name:
-                    continue
-                category = self.parser._category_lookup(name)
-                exercises.append(
-                    {
-                        "name": name,
-                        "display_order": ex_idx,
-                        "sets": int(ex.get("sets") or 1),
-                        "rep_range_low": ex.get("rep_range_low"),
-                        "rep_range_high": ex.get("rep_range_high"),
-                        "category": category,
-                        "superset_group": None,
-                        "muscle_groups": "",
-                        "notes": str(ex.get("notes") or "").strip(),
-                    }
-                )
-            days.append(
-                {
-                    "day_order": day_idx,
-                    "name": str(block.get("name") or f"Day {day_idx + 1}").strip() or f"Day {day_idx + 1}",
-                    "exercises": exercises,
-                }
-            )
-        return {"program_name": program_name.strip() or "Imported Program", "days": days}
-
-    async def _ask_program_name(self, channel: discord.abc.Messageable, author: discord.abc.User, fallback_text: str) -> str:
-        inferred = self._infer_program_name_from_text(fallback_text) or "Imported Program"
-        await send_discord_text(
-            channel,
-            f"What would you like to name this program? Reply in this channel within 60 seconds. (Default: `{inferred}`)",
-        )
-        try:
-            reply = await self.bot.wait_for(
-                "message",
-                timeout=60,
-                check=lambda m: m.author.id == author.id and m.channel.id == getattr(channel, "id", None),
-            )
-            candidate = reply.content.strip()
-            if candidate:
-                return candidate[:80]
-        except asyncio.TimeoutError:
-            pass
-        return inferred
+    def _clear_programme_flow_state(self, user_id: int, channel_id: int) -> None:
+        self._clear_pending_program(user_id, channel_id)
+        self._clear_post_import_context(user_id, channel_id)
+        self._clear_pending_exercise_type_prompt(user_id, channel_id)
+        self.pending_travel_context.pop(user_id, None)
 
     async def _resolve_programme_channel(self, guild: Optional[discord.Guild]) -> Optional[discord.TextChannel]:
         if guild is None:
@@ -578,63 +459,117 @@ class ProgrammeCog(commands.Cog):
             await self._start_pending_program(target, author, raw_text)
         return target
 
-    def _clear_programme_flow_state(self, user_id: int, channel_id: int) -> None:
-        pending = self._get_pending_program(user_id, channel_id)
-        if pending:
-            self._mark_flow_closed(user_id, channel_id, pending.flow_id)
-        self._cancel_review_task(user_id, channel_id)
-        self._clear_pending_program(user_id, channel_id)
-        self._clear_post_import_context(user_id)
-        self.pending_travel_context.pop(user_id, None)
-        self.memory.clear(user_id=user_id, channel_id=channel_id)
-
-    def clear_runtime_state(self) -> None:
-        for task in self.review_tasks.values():
-            if task and not task.done():
-                task.cancel()
-        self.review_tasks.clear()
-        self.post_import_state.clear()
-        self.pending_programs.clear()
-        self.closed_flows.clear()
-        self.user_locks.clear()
-        self.pending_travel_context.clear()
-        self.memory.clear_all()
-
-    def _is_confirm_message(self, text: str) -> bool:
-        normalized = " ".join(text.strip().lower().split())
-        return normalized in PENDING_CONFIRM_TOKENS or normalized.startswith("save")
-
-    def _is_cancel_message(self, text: str) -> bool:
-        normalized = " ".join(text.strip().lower().split())
-        return normalized in PENDING_CANCEL_TOKENS
-
-    async def _resolve_program_name(
+    async def _start_pending_program(
         self,
         channel: discord.abc.Messageable,
         author: discord.abc.User,
         raw_text: str,
-        parsed_name: str,
-    ) -> str:
-        if not self._is_placeholder_name(parsed_name):
-            return parsed_name.strip()
+        *,
+        temporary: bool = False,
+        parent_program_id: Optional[int] = None,
+        expires_at: Optional[str] = None,
+    ) -> None:
+        parsed = await self._parse_program_preview(channel, raw_text)
+        state = PendingProgram(
+            user_id=author.id,
+            channel_id=getattr(channel, "id", 0),
+            raw_text=raw_text,
+            parsed_program=parsed,
+            created_at=self._now_utc(),
+            temporary=temporary,
+            parent_program_id=parent_program_id,
+            expires_at=expires_at,
+            inferred_name=self._infer_program_name_from_text(raw_text) or str(parsed.get("program_name") or "Imported Program"),
+        )
+        self._set_pending_program(state)
+        await self._send_program_preview(channel, state.parsed_program, include_footer=True)
 
-        inferred = self._infer_program_name_from_text(raw_text)
-        if inferred:
-            return inferred
+    def _is_confirm_message(self, text: str) -> bool:
+        normalized = " ".join((text or "").strip().lower().split())
+        return normalized in CONFIRM_TOKENS or normalized.startswith("save")
 
-        await send_discord_text(channel, "What would you like to name this program?")
-        try:
-            reply = await self.bot.wait_for(
-                "message",
-                timeout=60,
-                check=lambda m: m.author.id == author.id and m.channel.id == getattr(channel, "id", None),
-            )
-            candidate = reply.content.strip()
-            if candidate:
-                return candidate[:80]
-        except asyncio.TimeoutError:
-            pass
-        return "Imported Program"
+    def _is_cancel_message(self, text: str) -> bool:
+        normalized = " ".join((text or "").strip().lower().split())
+        return normalized in CANCEL_TOKENS
+
+    def _sanitize_program_name(self, text: str, fallback: str) -> str:
+        candidate = (text or "").strip()
+        if not candidate:
+            return fallback
+        normalized = candidate.lower()
+        if normalized in CONFIRM_TOKENS or normalized in CANCEL_TOKENS:
+            return fallback
+        return candidate[:80]
+
+    def _display_program_id(self, program: Optional[dict[str, Any]]) -> str:
+        if not program:
+            return "n/a"
+        value = program.get("display_id")
+        if value is None:
+            value = program.get("id")
+        return str(value)
+
+    async def _schedule_name_timeout(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        flow_id: str,
+    ) -> None:
+        async def _timeout() -> None:
+            try:
+                await asyncio.sleep(60)
+                lock = self._get_user_lock(author.id)
+                async with lock:
+                    pending = self._get_pending_program(author.id, getattr(channel, "id", 0))
+                    if not pending or pending.flow_id != flow_id or pending.stage != "await_name":
+                        return
+                    await send_discord_text(channel, f"No name provided within 60 seconds, so I'll use `{pending.inferred_name}`.")
+                    await self._import_pending_program(channel, author, pending, pending.inferred_name)
+            except asyncio.CancelledError:
+                return
+            finally:
+                self.flow_timeout_tasks.pop(self._timeout_key(author.id, getattr(channel, "id", 0), "name"), None)
+
+        self._schedule_timeout(author.id, getattr(channel, "id", 0), "name", asyncio.create_task(_timeout()))
+
+    async def _schedule_day_timeout(self, channel: discord.abc.Messageable, user_id: int) -> None:
+        channel_id = getattr(channel, "id", 0)
+
+        async def _timeout() -> None:
+            try:
+                await asyncio.sleep(60)
+                lock = self._get_user_lock(user_id)
+                async with lock:
+                    context = self._get_post_import_context(user_id, channel_id)
+                    if not context:
+                        return
+                    await self.db.set_current_day_index(0, user_id=str(user_id))
+                    day = await self.db.get_day_for_index(0, user_id=str(user_id))
+                    day_name = str(day["name"]) if day else "Day 1"
+                    await send_discord_text(channel, f"No day selected within 60 seconds, so I'm starting you on **{day_name}** (Day 1).")
+                    self._clear_post_import_context(user_id, channel_id)
+                    await send_discord_text(channel, "Program saved and ready. Head to your workout channel and type `ready` to start.")
+            except asyncio.CancelledError:
+                return
+            finally:
+                self.flow_timeout_tasks.pop(self._timeout_key(user_id, channel_id, "day"), None)
+
+        self._schedule_timeout(user_id, channel_id, "day", asyncio.create_task(_timeout()))
+
+    async def _begin_save_flow(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        pending: PendingProgram,
+    ) -> None:
+        pending.stage = "await_name"
+        pending.created_at = self._now_utc()
+        self._set_pending_program(pending)
+        await send_discord_text(
+            channel,
+            f"What would you like to name this program? Reply in this channel within 60 seconds. (Default: `{pending.inferred_name}`)",
+        )
+        await self._schedule_name_timeout(channel, author, pending.flow_id)
 
     async def _start_day_prompt(self, channel: discord.abc.Messageable, program_id: int) -> None:
         days = await self.db.get_program_days(program_id)
@@ -645,6 +580,81 @@ class ProgrammeCog(commands.Cog):
             lines.append(f"{day['day_order'] + 1}. {day['name']}")
         lines.append("Reply with `start on Legs` or `start on Day 3`.")
         await send_discord_text(channel, "\n".join(lines))
+
+    async def _import_pending_program(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        pending: PendingProgram,
+        program_name: str,
+    ) -> None:
+        final_name = self._sanitize_program_name(program_name, pending.inferred_name)
+        payload = self._normalize_program_payload(
+            {**pending.parsed_program, "program_name": final_name},
+            fallback_name=final_name,
+        )
+        user_id = str(author.id)
+
+        async with channel.typing():
+            recent = await self.db.get_recent_program_by_name(payload["program_name"], user_id=user_id, minutes=5)
+            if recent:
+                self._clear_pending_program(pending.user_id, pending.channel_id)
+                display_id = int(recent.get("display_id") or recent.get("id") or 0)
+                await send_discord_text(
+                    channel,
+                    f"Skipped duplicate import: **{payload['program_name']}** was already imported recently (ID {display_id}).",
+                )
+                self._set_post_import_context(author.id, getattr(channel, "id", 0), int(recent["id"]), display_id)
+                await self._start_day_prompt(channel, int(recent["id"]))
+                await self._schedule_day_timeout(channel, author.id)
+                return
+
+            program_id = await self.db.create_program_from_payload(
+                payload,
+                user_id=user_id,
+                temporary=pending.temporary,
+                parent_program_id=pending.parent_program_id,
+                expires_at=pending.expires_at,
+            )
+            created_program = await self.db.get_program_by_id(program_id)
+
+        self._clear_pending_program(pending.user_id, pending.channel_id)
+        display_id = int(created_program.get("display_id") or program_id) if created_program else program_id
+        total_days = len(payload.get("days", []))
+        total_exercises = sum(len(day.get("exercises", [])) for day in payload.get("days", []))
+        await send_discord_text(
+            channel,
+            f"Imported **{payload['program_name']}** (ID {display_id}) with {total_days} days and {total_exercises} exercises.",
+        )
+        self._set_post_import_context(author.id, getattr(channel, "id", 0), program_id, display_id)
+        await self._start_day_prompt(channel, program_id)
+        await self._schedule_day_timeout(channel, author.id)
+
+    def _parse_start_day_index(self, text: str, days: list[dict[str, Any]]) -> Optional[int]:
+        plain_num = re.fullmatch(r"\s*(\d+)\s*", text)
+        if plain_num:
+            idx = int(plain_num.group(1)) - 1
+            if 0 <= idx < len(days):
+                return idx
+
+        match = DAY_NUMBER_RE.search(text)
+        if match:
+            idx = int(match.group("day_num")) - 1
+            if 0 <= idx < len(days):
+                return idx
+
+        lowered = text.lower()
+        for day in days:
+            day_name = str(day.get("name") or "").strip()
+            if day_name and day_name.lower() in lowered:
+                return int(day["day_order"])
+
+        normalized_text = self._normalize_name(text)
+        for day in days:
+            day_name = self._normalize_name(str(day.get("name") or ""))
+            if day_name and day_name in normalized_text:
+                return int(day["day_order"])
+        return None
 
     async def _handle_start_day_message(
         self,
@@ -679,57 +689,82 @@ class ProgrammeCog(commands.Cog):
             return True
 
         await self.db.set_current_day_index(idx, user_id=user_id)
-        logger.info("Set current_day_index to %s for user %s", idx, user_id if user_id is not None else "unknown")
-        selected = next((d for d in days if int(d["day_order"]) == idx), days[idx])
-        await send_discord_text(
-            channel,
-            f"✅ Starting day set to **{selected['name']}** (Day {idx + 1} of {len(days)}).",
-        )
+        selected = next((day for day in days if int(day["day_order"]) == idx), days[idx])
+        await send_discord_text(channel, f"Starting day set to **{selected['name']}** (Day {idx + 1} of {len(days)}).")
         return True
 
-    def _category_from_type_label(self, type_label: str) -> str:
-        normalized = type_label.strip().lower()
-        if normalized == "smith machine":
-            return "smith_machine"
-        if normalized == "barbell":
-            return "light_barbell"
-        if normalized in {"dumbbell", "bodyweight"}:
-            return normalized
-        if normalized in {"cable", "machine"}:
-            return "cable_machine"
-        return "cable_machine"
+    def _extract_equipment_type_reply(self, text: str) -> Optional[str]:
+        lowered = " ".join((text or "").strip().lower().split())
+        if not lowered:
+            return None
+        ordered = ["smith machine", "bodyweight", "barbell", "dumbbell", "cable", "machine", "unknown"]
+        for choice in ordered:
+            if choice in lowered:
+                return choice
+        if lowered in {"smith", "bw", "db"}:
+            return self._normalize_equipment_type(lowered)
+        return None
 
-    async def _ask_exercise_type_for_new_name(
+    async def _apply_active_swap(
         self,
-        *,
         channel: discord.abc.Messageable,
+        *,
+        user_id: str,
         old_name: str,
         new_name: str,
-        requester_id: Optional[int] = None,
-    ) -> str:
+        day_hint: Optional[str],
+        equipment_type: str,
+    ) -> None:
+        category = self._db_category_from_equipment_type(new_name, equipment_type)
+        replaced = await self.db.replace_exercise_in_active_program(
+            old_name=old_name,
+            new_name=new_name,
+            user_id=user_id,
+            day_name_hint=day_hint or None,
+            new_category=category,
+            new_equipment_type=equipment_type,
+        )
+        if not replaced:
+            await send_discord_text(channel, f"Couldn't find `{old_name}` in the active program.")
+            return
+        active = await self.db.get_active_program(user_id)
+        program_name = str(active["name"]) if active else "Active Program"
+        display_id = self._display_program_id(active)
         await send_discord_text(
             channel,
-            (
-                f"`{new_name}` isn't in your current program yet. "
-                "What type is it? Reply with one of: "
-                "`barbell`, `dumbbell`, `cable`, `machine`, `bodyweight`, `smith machine`."
-            ),
+            f"Updated {program_name} (ID {display_id}): replaced {replaced['old_name']} with {replaced['new_name']} ({replaced['equipment_type']}) on {replaced['day_name']}.",
         )
-        try:
-            reply = await self.bot.wait_for(
-                "message",
-                timeout=60,
-                check=lambda m: m.channel.id == getattr(channel, "id", None)
-                and (requester_id is None or m.author.id == requester_id),
-            )
-            choice = reply.content.strip().lower()
-            if choice in EXERCISE_TYPE_CHOICES:
-                return self._category_from_type_label(choice)
-        except asyncio.TimeoutError:
-            pass
 
-        fallback = self.parser._category_lookup(old_name)
-        return fallback
+    async def _handle_pending_exercise_type_prompt(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        content: str,
+    ) -> bool:
+        prompt = self.pending_exercise_type_prompts.get(self._pending_key(author.id, getattr(channel, "id", 0)))
+        if not prompt:
+            return False
+        if prompt.created_at + timedelta(minutes=5) < self._now_utc():
+            self._clear_pending_exercise_type_prompt(author.id, getattr(channel, "id", 0))
+            await send_discord_text(channel, "That exercise-type prompt expired. Ask for the swap again if you still want it.")
+            return True
+        equipment_type = self._extract_equipment_type_reply(content)
+        if equipment_type is None:
+            await send_discord_text(
+                channel,
+                "Reply with one type: `barbell`, `dumbbell`, `cable`, `machine`, `bodyweight`, or `smith machine`.",
+            )
+            return True
+        self._clear_pending_exercise_type_prompt(author.id, getattr(channel, "id", 0))
+        await self._apply_active_swap(
+            channel,
+            user_id=str(author.id),
+            old_name=prompt.old_name,
+            new_name=prompt.new_name,
+            day_hint=prompt.day_hint,
+            equipment_type=equipment_type,
+        )
+        return True
 
     async def _handle_simple_edit_request(
         self,
@@ -737,265 +772,81 @@ class ProgrammeCog(commands.Cog):
         text: str,
         *,
         user_id: str,
+        requester_id: int,
     ) -> bool:
-        lowered = text.lower().strip()
-
         swap_match = SWAP_RE.search(text)
         if swap_match:
             old_name = str(swap_match.group("old") or "").strip(" .")
             new_name = str(swap_match.group("new") or "").strip(" .")
-            day_hint = str(swap_match.group("day") or "").strip(" .")
+            day_hint = str(swap_match.group("day") or "").strip(" .") or None
 
             existing_new = await self.db.get_exercise_by_name_in_current_program(new_name, user_id=user_id)
-            new_category: Optional[str] = None
             if existing_new:
-                new_category = str(existing_new.get("category") or "cable_machine")
-            else:
-                new_category = await self._ask_exercise_type_for_new_name(
-                    channel=channel,
+                equipment_type = self._normalize_equipment_type(str(existing_new.get("equipment_type") or ""))
+                if equipment_type == "unknown":
+                    equipment_type = self._exercise_type_from_name_and_category(new_name, str(existing_new.get("category") or ""))
+                await self._apply_active_swap(
+                    channel,
+                    user_id=user_id,
                     old_name=old_name,
                     new_name=new_name,
-                    requester_id=int(user_id),
+                    day_hint=day_hint,
+                    equipment_type=equipment_type,
                 )
+                return True
 
-            replaced = await self.db.replace_exercise_in_active_program(
+            fallback_type = self._exercise_type_from_name_and_category(new_name, self.parser._category_lookup(new_name))
+            self.pending_exercise_type_prompts[self._pending_key(requester_id, getattr(channel, "id", 0))] = PendingExerciseTypePrompt(
+                user_id=requester_id,
+                channel_id=getattr(channel, "id", 0),
                 old_name=old_name,
                 new_name=new_name,
-                user_id=user_id,
-                day_name_hint=day_hint or None,
-                new_category=new_category,
+                day_hint=day_hint,
+                created_at=self._now_utc(),
+                fallback_type=fallback_type,
             )
-            if replaced:
-                active = await self.db.get_active_program(user_id)
-                program_name = str(active["name"]) if active else "Active Program"
-                await send_discord_text(
-                    channel,
-                    f"Updated {program_name} (ID {active['id'] if active else 'n/a'}): "
-                    f"replaced {replaced['old_name']} with {replaced['new_name']} "
-                    f"({self._exercise_type_label(replaced['new_name'], category=str(replaced['category']))}) "
-                    f"on {replaced['day_name']}.",
-                )
-            else:
-                await send_discord_text(channel, f"Couldn't find `{old_name}` in the active program.")
+            await send_discord_text(
+                channel,
+                f"`{new_name}` isn't in your current program yet. What type is it? Reply with `barbell`, `dumbbell`, `cable`, `machine`, `bodyweight`, or `smith machine`.",
+            )
             return True
 
-        change_match = re.search(r"change\s+(.+?)\s+to\s+(.+)$", text, re.IGNORECASE)
+        change_match = CHANGE_RE.search(text)
         if change_match:
             old_name = change_match.group(1).strip(" .")
             new_name = change_match.group(2).strip(" .")
-
             day_rows = await self.db.rename_program_day_in_active_program(old_name, new_name, user_id=user_id)
             if day_rows > 0:
-                await send_discord_text(channel, f"✅ Renamed day: **{old_name}** -> **{new_name}**.")
+                await send_discord_text(channel, f"Renamed day: **{old_name}** -> **{new_name}**.")
                 return True
-
             ex_rows = await self.db.update_exercise_name_in_active_program(old_name, new_name, user_id=user_id)
             if ex_rows > 0:
-                await send_discord_text(channel, f"✅ Renamed exercise: **{old_name}** -> **{new_name}**.")
+                await send_discord_text(channel, f"Renamed exercise: **{old_name}** -> **{new_name}**.")
             else:
-                await send_discord_text(
-                    channel,
-                    "I couldn't apply that change directly. Try `swap <old exercise> with <new exercise>`.",
-                )
-            return True
-
-        if EDIT_INTENT_RE.search(lowered):
-            await send_discord_text(
-                channel,
-                "Use explicit edit commands like `swap X with Y`, `remove X from Day 2`, or `add Face Pulls to Pull day, 3x15`.",
-            )
+                await send_discord_text(channel, "I couldn't apply that change directly. Try `swap <old exercise> with <new exercise>`.")
             return True
 
         return False
 
-    async def _suggest_pending_changes(self, state: PendingProgram) -> str:
-        history = self.memory.get(user_id=state.user_id, channel_id=state.channel_id)
-        exercise_summary = self._extract_exercise_summary(state.raw_text)
+    async def _generate_travel_draft(self, channel: discord.abc.Messageable, base_program_text: str, travel_note: str) -> str:
         payload = {
-            "program_text": state.raw_text,
-            "exercise_summary": exercise_summary,
-            "user_constraints": state.notes,
-            "history": history,
-            "task": "Review this program and propose practical swaps/edits based on constraints.",
-            "format": "Use concise bullet points, then a 1-line question.",
-        }
-        reply = await self.bot.ollama.chat(
-            system=(
-                f"{FITNESS_ONLY_GUARDRAIL}\n"
-                "You are reviewing a workout program before import. "
-                "Focus on feasibility with equipment constraints and training goals. "
-                "If discussing Smith Machine swaps: only suggest Smith alternatives for heavy_barbell/light_barbell exercises. "
-                "Never relabel dumbbell/cable/machine/bodyweight lifts as Smith Machine."
-            ),
-            user=json.dumps(payload, ensure_ascii=False),
-            temperature=0.2,
-            max_tokens=380,
-        )
-        return reply.strip()
-
-    async def _suggest_pending_changes_by_day(self, state: PendingProgram) -> list[str]:
-        history = self.memory.get(user_id=state.user_id, channel_id=state.channel_id)
-        day_blocks = self.parser._extract_day_blocks(state.raw_text)
-        if not day_blocks:
-            single = await self._suggest_pending_changes(state)
-            return [single]
-
-        messages: list[str] = []
-        for idx, block in enumerate(day_blocks):
-            day_name = str(block.get("name") or f"Day {idx + 1}")
-            exercises = block.get("exercises") or []
-            payload = {
-                "day_name": day_name,
-                "day_order": idx + 1,
-                "exercises": exercises,
-                "user_constraints": state.notes,
-                "history": history,
-                "task": "Give focused swap suggestions for this day only.",
-                "format": "Use 3-6 short bullets. Mention only actionable edits.",
-            }
-            try:
-                review = await self.bot.ollama.chat(
-                    system=(
-                        f"{FITNESS_ONLY_GUARDRAIL}\n"
-                        "You are reviewing one training day before import. "
-                        "Focus on practical swaps and consistency. "
-                        "If discussing Smith Machine swaps: only suggest Smith alternatives for heavy_barbell/light_barbell exercises. "
-                        "Never relabel dumbbell/cable/machine/bodyweight lifts as Smith Machine."
-                    ),
-                    user=json.dumps(payload, ensure_ascii=False),
-                    temperature=0.2,
-                    max_tokens=260,
-                )
-                body = review.strip() or "No major swaps needed for this day."
-            except Exception:
-                body = "No major swaps needed for this day."
-            messages.append(f"**Day {idx + 1} - {day_name}**\n{body}")
-        return messages
-
-    async def _send_day_reviews(
-        self,
-        channel: discord.abc.Messageable,
-        day_reviews: list[str],
-        *,
-        updated: bool = False,
-    ) -> None:
-        header = "Updated review by day:" if updated else "I reviewed your program before importing:"
-        await send_discord_text(channel, header)
-        for review in day_reviews:
-            await send_discord_text(channel, review)
-        await send_discord_text(
-            channel,
-            "Reply with edits if you want changes, `save` to import, or `cancel` to discard.",
-        )
-
-    async def _render_program_for_import(self, state: PendingProgram) -> str:
-        if not state.notes:
-            return state.raw_text
-
-        exercise_summary = self._extract_exercise_summary(state.raw_text)
-        payload = {
-            "program_text": state.raw_text,
-            "exercise_summary": exercise_summary,
-            "requested_changes": state.notes,
-            "instructions": "Return only the finalized program text with day headers and exercise lines. No commentary.",
-        }
-        rewritten = await self.bot.ollama.chat(
-            system=(
-                f"{FITNESS_ONLY_GUARDRAIL}\n"
-                "Rewrite the workout program text by applying the requested changes. "
-                "Preserve clear day/exercise structure and sets x reps. "
-                "Only apply Smith Machine renames to heavy_barbell/light_barbell categories."
-            ),
-            user=json.dumps(payload, ensure_ascii=False),
-            temperature=0.15,
-            max_tokens=900,
-        )
-        final_text = rewritten.strip() or state.raw_text
-        combined_notes = " ".join(state.notes).lower()
-        if "smith" in combined_notes:
-            final_text = self._enforce_smith_machine_consistency(final_text, exercise_summary)
-        return final_text
-
-    def _enforce_smith_machine_consistency(
-        self,
-        program_text: str,
-        summary: list[dict[str, Any]],
-    ) -> str:
-        lines = program_text.splitlines()
-        heavy_or_light: dict[str, str] = {}
-        not_smith: dict[str, str] = {}
-        for ex in summary:
-            original = str(ex.get("name") or "").strip()
-            if not original:
-                continue
-            key = original.lower()
-            if str(ex.get("category") or "") in {"heavy_barbell", "light_barbell"}:
-                heavy_or_light[key] = original
-            else:
-                not_smith[key] = original
-
-        out_lines: list[str] = []
-        for line in lines:
-            updated = line
-            lower_line = updated.lower()
-            for name, original in heavy_or_light.items():
-                if name in lower_line and "smith machine" not in lower_line:
-                    pattern = re.compile(re.escape(name), re.IGNORECASE)
-                    updated = pattern.sub(f"Smith Machine {original}", updated, count=1)
-                    lower_line = updated.lower()
-                    break
-            for name, original in not_smith.items():
-                smith_name = f"smith machine {name}"
-                if smith_name in lower_line:
-                    pattern = re.compile(re.escape(smith_name), re.IGNORECASE)
-                    updated = pattern.sub(original, updated, count=1)
-                    lower_line = updated.lower()
-                    break
-            out_lines.append(updated)
-        return "\n".join(out_lines)
-
-    async def _start_pending_program(
-        self,
-        channel: discord.abc.Messageable,
-        author: discord.abc.User,
-        raw_text: str,
-    ) -> None:
-        self._cancel_review_task(author.id, getattr(channel, "id", 0))
-        state = PendingProgram(
-            user_id=author.id,
-            channel_id=getattr(channel, "id", 0),
-            raw_text=raw_text,
-            created_at=self._now_utc(),
-        )
-        self._set_pending_program(state)
-        await self._send_program_preview(channel, state.raw_text, include_footer=True)
-
-    async def _generate_travel_draft(self, base_program_text: str, travel_note: str) -> str:
-        prompt_payload = {
             "base_program": base_program_text,
             "constraints": travel_note,
-            "instruction": (
-                "Apply only equipment/travel constraint changes. Keep the same day structure and rep schemes where possible. "
-                "Return only program text with day headers and exercise lines."
-            ),
+            "instruction": "Apply only the explicit travel or equipment constraints. Keep the same day structure and preserve rep schemes when possible. Return only program text with day headers and exercise lines.",
         }
-        try:
+        async with channel.typing():
             result = await self.bot.ollama.chat(
                 system=(
                     f"{PROGRAMME_IMPORT_SYSTEM_PROMPT}\n"
-                    "The user explicitly requested travel/equipment edits. "
-                    "You are updating a workout program for temporary travel/equipment constraints. "
-                    "Apply only the requested equipment changes, keep the original day structure, and preserve rep schemes when possible. "
-                    "Return only the updated program text with day headers and exercise lines. No commentary."
+                    "The user explicitly requested a temporary travel or limited-equipment version. "
+                    "Apply only those constraints and return only the updated program text."
                 ),
-                user=json.dumps(prompt_payload, ensure_ascii=False),
+                user=json.dumps(payload, ensure_ascii=False),
                 temperature=0.2,
-                max_tokens=850,
+                max_tokens=900,
             )
-            cleaned = result.strip()
-            return cleaned or base_program_text
-        except Exception:
-            return base_program_text
+        cleaned = result.strip()
+        return cleaned or base_program_text
 
     async def _start_travel_pending_program(
         self,
@@ -1013,145 +864,46 @@ class ProgrammeCog(commands.Cog):
         equipment_hints = {"dumbbell", "db", "cable", "machine", "smith", "barbell", "bodyweight", "bands", "kettlebell"}
         if not any(token in travel_note.lower() for token in equipment_hints):
             self.pending_travel_context[author.id] = (travel_note, self._now_utc() + timedelta(minutes=10))
-            await send_discord_text(
-                channel,
-                "What equipment will you have while traveling? For example: `dumbbells up to 30kg and cable machine`.",
-            )
+            await send_discord_text(channel, "What equipment will you have while traveling? For example: `dumbbells up to 30kg and a cable machine`.")
             return False
 
-        base_text = await self._program_to_text(int(active["id"]))
-        draft_text = await self._generate_travel_draft(base_text, travel_note)
+        days = await self.db.get_program_days(int(active["id"]))
+        lines: list[str] = []
+        for day in days:
+            lines.append(str(day.get("name") or f"Day {int(day.get('day_order', 0)) + 1}"))
+            exercises = await self.db.get_exercises_for_day(int(day["id"]))
+            for exercise in exercises:
+                low = exercise.get("rep_range_low")
+                high = exercise.get("rep_range_high")
+                if low is not None and high is not None:
+                    scheme = f"{exercise['sets']}x{low}" if int(low) == int(high) else f"{exercise['sets']}x{low}-{high}"
+                else:
+                    scheme = f"{exercise['sets']}xAMRAP"
+                lines.append(f"{exercise['name']} - {scheme}")
+            lines.append("")
+        base_program_text = "\n".join(lines).strip()
+        draft_text = await self._generate_travel_draft(channel, base_program_text, travel_note)
         expires_at = self._extract_travel_expiry(travel_note)
-        self._cancel_review_task(author.id, getattr(channel, "id", 0))
-        state = PendingProgram(
-            user_id=author.id,
-            channel_id=getattr(channel, "id", 0),
-            raw_text=draft_text,
-            created_at=self._now_utc(),
-            notes=[travel_note],
+        await send_discord_text(channel, "I drafted a temporary version based on those constraints:")
+        await self._start_pending_program(
+            channel,
+            author,
+            draft_text,
             temporary=True,
             parent_program_id=int(active["id"]),
             expires_at=expires_at,
         )
-        self._set_pending_program(state)
-        await send_discord_text(channel, "I drafted a temporary travel version based on your constraints:")
-        await self._send_program_preview(channel, state.raw_text, include_footer=False)
-        await send_discord_text(
-            channel,
-            "Reply with edits, `save` to import this temporary version, or `cancel`.",
-        )
         if expires_at:
-            await send_discord_text(
-                channel,
-                f"This will save as a temporary travel program until **{expires_at}** once you reply `save`.",
-            )
+            await send_discord_text(channel, f"This will save as a temporary program until **{expires_at}** once you reply `save`.")
         else:
-            await send_discord_text(
-                channel,
-                "Reply with expected duration (for example `2 weeks`) if you want auto-revert by date.",
-            )
+            await send_discord_text(channel, "Reply with the trip duration too, like `1 week`, if you want it to auto-revert.")
         self.pending_travel_context.pop(author.id, None)
         return True
 
-    async def _finalize_pending_program(
-        self,
-        channel: discord.abc.Messageable,
-        author: discord.abc.User,
-        state: PendingProgram,
-    ) -> None:
-        self._cancel_review_task(state.user_id, state.channel_id)
-        final_text = state.raw_text
-        program_name = await self._ask_program_name(channel, author, final_text)
-        parsed = self._build_payload_from_raw_text(final_text, program_name)
-        user_id = str(author.id)
-        recent = await self.db.get_recent_program_by_name(parsed["program_name"], user_id=user_id, minutes=5)
-        if recent:
-            self._mark_flow_closed(state.user_id, state.channel_id, state.flow_id)
-            self._clear_pending_program(state.user_id, state.channel_id)
-            await send_discord_text(
-                channel,
-                f"⚠️ Skipped duplicate import: **{parsed['program_name']}** was already imported recently (ID {recent['id']}).",
-            )
-            self._set_post_import_context(author.id, getattr(channel, "id", 0), int(recent["id"]))
-            await self._start_day_prompt(channel, int(recent["id"]))
-            return
-
-        program_id = await self.db.create_program_from_payload(
-            parsed,
-            user_id=user_id,
-            temporary=state.temporary,
-            parent_program_id=state.parent_program_id,
-            expires_at=state.expires_at,
-        )
-
-        days = parsed.get("days", [])
-        total_exercises = sum(len(day.get("exercises", [])) for day in days)
-        self._mark_flow_closed(state.user_id, state.channel_id, state.flow_id)
-        self._clear_pending_program(state.user_id, state.channel_id)
+    async def _reply_programme_message(self, channel: discord.abc.Messageable) -> None:
         await send_discord_text(
             channel,
-            f"✅ Imported **{parsed['program_name']}** (ID {program_id}) with "
-            f"{len(days)} days and {total_exercises} exercises.",
-        )
-        self._set_post_import_context(author.id, getattr(channel, "id", 0), program_id)
-        await self._start_day_prompt(channel, program_id)
-
-    def _recover_missing_exercises_from_original(
-        self,
-        parsed: dict[str, Any],
-        original_text: str,
-    ) -> dict[str, Any]:
-        original_blocks = self.parser._extract_day_blocks(original_text)
-        if not original_blocks:
-            return parsed
-
-        parsed_days = parsed.get("days", [])
-        if not parsed_days:
-            return parsed
-
-        for day_idx, original_day in enumerate(original_blocks):
-            if day_idx >= len(parsed_days):
-                break
-            parsed_day = parsed_days[day_idx]
-            parsed_ex = parsed_day.get("exercises", [])
-            original_ex = original_day.get("exercises", [])
-            if len(parsed_ex) >= len(original_ex):
-                continue
-            existing_names = {str(ex.get("name") or "").strip().lower() for ex in parsed_ex}
-            for raw_ex in original_ex:
-                name = str(raw_ex.get("name") or "").strip()
-                if not name:
-                    continue
-                if name.lower() in existing_names:
-                    continue
-                parsed_ex.append(
-                    {
-                        "name": name,
-                        "display_order": len(parsed_ex),
-                        "sets": int(raw_ex.get("sets") or 1),
-                        "rep_range_low": raw_ex.get("rep_range_low"),
-                        "rep_range_high": raw_ex.get("rep_range_high"),
-                        "category": self.parser._category_lookup(name),
-                        "superset_group": None,
-                        "muscle_groups": "",
-                        "notes": str(raw_ex.get("notes") or "recovered_from_source"),
-                    }
-                )
-                existing_names.add(name.lower())
-            parsed_day["exercises"] = parsed_ex
-        return parsed
-
-    async def _reply_programme_message(
-        self,
-        channel: discord.abc.Messageable,
-        text: str,
-        *,
-        user_id: int,
-    ) -> None:
-        await send_discord_text(
-            channel,
-            "Paste a full program to preview/import, or use explicit edits like "
-            "`swap X with Y`, `remove X`, `add X to Day Y, 3x15`, then `save`.",
+            "Paste a full program and I'll list it back exactly as written. If you want to edit the active program, say something like `swap Lat Pulldowns with Pull-Ups on Pull day`.",
         )
 
     @commands.command(name="import")
@@ -1160,7 +912,10 @@ class ProgrammeCog(commands.Cog):
             return
         lock = self._get_user_lock(ctx.author.id)
         async with lock:
-            await self._start_pending_program(ctx.channel, ctx.author, text)
+            try:
+                await self._start_pending_program(ctx.channel, ctx.author, text)
+            except Exception as exc:
+                await send_discord_text(ctx.channel, f"I couldn't parse that cleanly yet: {exc}")
 
     @commands.command(name="program")
     async def show_program_command(self, ctx: commands.Context) -> None:
@@ -1169,14 +924,13 @@ class ProgrammeCog(commands.Cog):
         if not program:
             await send_discord_text(ctx.channel, "No active program yet. Paste one in #programme.")
             return
-        days = await self.db.get_program_days(program["id"])
+        days = await self.db.get_program_days(int(program["id"]))
         if not days:
             await send_discord_text(ctx.channel, f"Active program **{program['name']}** has no days.")
             return
-
-        lines = [f"Active program: **{program['name']}** ({len(days)} days)"]
+        lines = [f"Active program: **{program['name']}** (ID {self._display_program_id(program)}, {len(days)} days)"]
         for day in days:
-            exercises = await self.db.get_exercises_for_day(day["id"])
+            exercises = await self.db.get_exercises_for_day(int(day["id"]))
             lines.append(f"Day {day['day_order'] + 1}: {day['name']} ({len(exercises)} exercises)")
         await send_discord_text(ctx.channel, "\n".join(lines))
 
@@ -1198,26 +952,16 @@ class ProgrammeCog(commands.Cog):
                 await send_discord_text(ctx.channel, "Couldn't parse that day selection. Try `!startday Day 3` or `!startday Legs`.")
                 return
             if context:
-                self._clear_programme_flow_state(ctx.author.id, ctx.channel.id)
-                await send_discord_text(
-                    ctx.channel,
-                    "Program saved and ready. Head to your workout channel and type `ready` to start.",
-                )
+                self._clear_post_import_context(ctx.author.id, ctx.channel.id)
+                await send_discord_text(ctx.channel, "Program saved and ready. Head to your workout channel and type `ready` to start.")
 
     @commands.command(name="travel")
     async def travel_program_command(self, ctx: commands.Context, *, text: str) -> None:
         if not self._is_programme_channel(ctx.channel):
             return
-
         lock = self._get_user_lock(ctx.author.id)
         async with lock:
-            started = await self._start_travel_pending_program(
-                ctx.channel,
-                ctx.author,
-                travel_note=text,
-            )
-            if not started:
-                return
+            await self._start_travel_pending_program(ctx.channel, ctx.author, travel_note=text)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -1237,33 +981,24 @@ class ProgrammeCog(commands.Cog):
             reverted = await self.db.check_and_revert_expired_temporary_program(str(user_id))
             if reverted:
                 parent_name = reverted.get("parent_program_name") or "your previous program"
-                await send_discord_text(
-                    message.channel,
-                    f"Welcome back! Reverted to {parent_name}.",
-                )
+                display_id = reverted.get("parent_display_id")
+                suffix = f" (ID {display_id})" if display_id else ""
+                await send_discord_text(message.channel, f"Welcome back! Reverted to {parent_name}{suffix}.")
 
-            context = self._get_post_import_context(user_id, channel_id)
-            self.memory.append(user_id=user_id, channel_id=channel_id, role="user", content=content)
-
-            pending = self._get_pending_program(user_id, channel_id)
             pending_travel = self.pending_travel_context.get(user_id)
             if pending_travel:
                 original_note, expires_at = pending_travel
                 if expires_at < self._now_utc():
                     self.pending_travel_context.pop(user_id, None)
-                elif not pending and not self._looks_like_program_paste(content):
+                elif not self._get_pending_program(user_id, channel_id) and not self._looks_like_program_paste(content):
                     combined_note = f"{original_note}. Equipment: {content}"
-                    started = await self._start_travel_pending_program(
-                        message.channel,
-                        message.author,
-                        travel_note=combined_note,
-                    )
+                    started = await self._start_travel_pending_program(message.channel, message.author, travel_note=combined_note)
                     if started:
                         return
 
             if BACK_INTENT_RE.search(content):
-                reverted = await self.db.revert_from_temporary_program(str(user_id))
-                if reverted:
+                reverted_now = await self.db.revert_from_temporary_program(str(user_id))
+                if reverted_now:
                     active = await self.db.get_active_program(str(user_id))
                     if active:
                         day_index = await self.db.get_current_day_index(str(user_id))
@@ -1271,7 +1006,7 @@ class ProgrammeCog(commands.Cog):
                         day_name = str(day["name"]) if day else f"Day {day_index + 1}"
                         await send_discord_text(
                             message.channel,
-                            f"Welcome back! Reverted to **{active['name']}**. You left off on {day_name} (Day {day_index + 1}).",
+                            f"Welcome back! Reverted to **{active['name']}** (ID {self._display_program_id(active)}). You left off on {day_name} (Day {day_index + 1}).",
                         )
                     else:
                         await send_discord_text(message.channel, "Welcome back! Reverted to your base program.")
@@ -1279,46 +1014,57 @@ class ProgrammeCog(commands.Cog):
                     await send_discord_text(message.channel, "No active temporary travel program found.")
                 return
 
-            if self._looks_like_program_paste(content):
-                try:
-                    await self._start_pending_program(message.channel, message.author, content)
-                except Exception as exc:
-                    await send_discord_text(message.channel, f"Could not process program draft: {exc}")
+            if await self._handle_pending_exercise_type_prompt(message.channel, message.author, content):
                 return
 
+            pending = self._get_pending_program(user_id, channel_id)
             if pending:
                 if self._is_cancel_message(content):
                     self._clear_programme_flow_state(user_id, channel_id)
                     await send_discord_text(message.channel, "Pending program import discarded.")
                     return
+                if pending.stage == "await_name":
+                    await self._import_pending_program(message.channel, message.author, pending, content)
+                    return
                 if self._is_confirm_message(content):
-                    try:
-                        await self._finalize_pending_program(message.channel, message.author, pending)
-                    except Exception as exc:
-                        await send_discord_text(message.channel, f"Could not import program: {exc}")
+                    await self._begin_save_flow(message.channel, message.author, pending)
                     return
-                blocks = self.parser._extract_day_blocks(pending.raw_text)
-                changed, reply = self._apply_edit_to_blocks(blocks, content)
-                if not changed:
-                    await send_discord_text(message.channel, reply)
+                try:
+                    status, llm_message, updated_program = await self._apply_pending_edit_with_llm(message.channel, pending, content)
+                except Exception as exc:
+                    await send_discord_text(message.channel, f"I couldn't apply that edit cleanly yet: {exc}")
                     return
-                pending.raw_text = self._blocks_to_program_text(blocks)
-                pending.created_at = self._now_utc()
-                pending.notes.append(content)
-                self._set_pending_program(pending)
-                await send_discord_text(message.channel, f"✅ {reply}")
-                await self._send_program_preview(message.channel, pending.raw_text, include_footer=True)
+                if status == "updated" and updated_program is not None:
+                    pending.parsed_program = updated_program
+                    pending.raw_text = self._program_to_text(updated_program)
+                    pending.created_at = self._now_utc()
+                    self._set_pending_program(pending)
+                    if llm_message:
+                        await send_discord_text(message.channel, llm_message)
+                    await self._send_program_preview(message.channel, pending.parsed_program, include_footer=True)
+                    return
+                if llm_message:
+                    await send_discord_text(message.channel, llm_message)
+                else:
+                    await send_discord_text(message.channel, "Tell me the exact change you want and I'll apply only that.")
+                return
+
+            if self._looks_like_program_paste(content):
+                try:
+                    await self._start_pending_program(message.channel, message.author, content)
+                except Exception:
+                    await send_discord_text(
+                        message.channel,
+                        "I couldn't cleanly parse that yet. Re-send it with the day headers and exercise lines intact and I'll try again.",
+                    )
                 return
 
             if TRAVEL_INTENT_RE.search(content):
-                started = await self._start_travel_pending_program(
-                    message.channel,
-                    message.author,
-                    travel_note=content,
-                )
+                started = await self._start_travel_pending_program(message.channel, message.author, travel_note=content)
                 if started:
                     return
 
+            context = self._get_post_import_context(user_id, channel_id)
             handled_start_day = await self._handle_start_day_message(
                 message.channel,
                 content,
@@ -1328,17 +1074,14 @@ class ProgrammeCog(commands.Cog):
             )
             if handled_start_day:
                 if context:
-                    self._clear_programme_flow_state(user_id, channel_id)
-                    await send_discord_text(
-                        message.channel,
-                        "Program saved and ready. Head to your workout channel and type `ready` to start.",
-                    )
+                    self._clear_post_import_context(user_id, channel_id)
+                    await send_discord_text(message.channel, "Program saved and ready. Head to your workout channel and type `ready` to start.")
                 return
 
-            if await self._handle_simple_edit_request(message.channel, content, user_id=str(user_id)):
+            if await self._handle_simple_edit_request(message.channel, content, user_id=str(user_id), requester_id=user_id):
                 return
 
-            await self._reply_programme_message(message.channel, content, user_id=user_id)
+            await self._reply_programme_message(message.channel)
 
 
 async def setup(bot: commands.Bot) -> None:

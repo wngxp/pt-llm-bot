@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 
-DISCORD_MESSAGE_LIMIT = 4000
+DISCORD_MESSAGE_LIMIT = 2000
 
 
 def split_discord_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:

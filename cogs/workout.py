@@ -156,6 +156,7 @@ class LoggedSetMessageRef:
     exercise_id: int
     exercise_name: str
     category: str
+    equipment_type: str
     weight: float
     reps: int
     unit: str
@@ -1037,25 +1038,25 @@ class WorkoutCog(commands.Cog):
             f"Noted fatigue cue. Readiness adjusted to {next_readiness}/10 for upcoming suggestions."
         )
 
-    def _is_pr_announce_exercise(self, category: str, exercise_name: str) -> bool:
-        normalized_category = (category or "").strip().lower()
-        if normalized_category in {"heavy_barbell", "light_barbell", "smith_machine"}:
-            return True
-        if normalized_category != "bodyweight":
-            return False
+    def _exercise_type_label(self, exercise: dict[str, Any]) -> str:
+        equipment_type = str(exercise.get("equipment_type") or "").strip().lower()
+        if equipment_type:
+            return equipment_type.replace("_", " ")
+        return str(exercise.get("category") or "cable_machine").replace("_", " ")
+
+    def _is_pr_announce_exercise(self, exercise_name: str, equipment_type: str) -> bool:
         lowered = exercise_name.lower()
-        compound_tokens = {
-            "pull-up",
-            "pull up",
-            "chin-up",
-            "chin up",
-            "dip",
-            "push-up",
-            "push up",
-            "inverted row",
-            "row",
-        }
-        return any(token in lowered for token in compound_tokens)
+        normalized_type = (equipment_type or "").strip().lower()
+        if normalized_type not in {"barbell", "smith machine"}:
+            return False
+        if "bench" in lowered:
+            return True
+        if "deadlift" in lowered:
+            return True
+        if "squat" not in lowered:
+            return False
+        excluded = {"split squat", "goblet squat", "hack squat", "belt squat", "cyclist squat"}
+        return not any(token in lowered for token in excluded)
 
     async def _check_and_record_pr(
         self,
@@ -1066,6 +1067,7 @@ class WorkoutCog(commands.Cog):
         unit: str,
         workout_log_id: int,
         category: str,
+        equipment_type: str,
         user_id: str,
         performer_name: Optional[str] = None,
         performer_user_id: Optional[str] = None,
@@ -1107,7 +1109,7 @@ class WorkoutCog(commands.Cog):
         else:
             logger.info("PR CHECK: existing personal_records row found for %s", exercise_name)
 
-        should_announce = self._is_pr_announce_exercise(category, exercise_name)
+        should_announce = self._is_pr_announce_exercise(exercise_name, equipment_type)
 
         if not existing:
             logger.info("PR baseline created for %s: %s %s x %s", exercise_name, weight, unit, reps)
@@ -1141,7 +1143,8 @@ class WorkoutCog(commands.Cog):
                     payload,
                     (
                         f"📊 First {exercise_name} logged! "
-                        f"{format_standard_number(weight)} {unit} x {reps} - this is your starting benchmark."
+                        f"{format_standard_number(weight)} {unit} x {reps} "
+                        f"(e1RM: {format_standard_number(e1rm)}) - this is your starting benchmark."
                     ),
                 )
             logger.info("PR CHECK: is_pr=False, pr_type=first_non_announced")
@@ -1224,13 +1227,14 @@ class WorkoutCog(commands.Cog):
         unit: str,
         workout_log_id: int,
         category: str,
+        equipment_type: str,
         user_id: str,
         performer_name: Optional[str] = None,
         performer_user_id: Optional[str] = None,
     ) -> Optional[str]:
         if weight <= 0:
             return None
-        should_announce = self._is_pr_announce_exercise(category, exercise_name)
+        should_announce = self._is_pr_announce_exercise(exercise_name, equipment_type)
         e1rm = epley_1rm(weight, reps)
         existing = await self.db.get_best_pr_excluding_log(
             exercise_name,
@@ -1278,7 +1282,8 @@ class WorkoutCog(commands.Cog):
                 self.bot.dispatch("pr_hit", payload)
                 return (
                     f"📊 First {exercise_name} logged! "
-                    f"{format_standard_number(weight)} {unit} x {reps} - this is your starting benchmark."
+                    f"{format_standard_number(weight)} {unit} x {reps} "
+                    f"(e1RM: {format_standard_number(e1rm)}) - this is your starting benchmark."
                 )
             return None
 
@@ -1315,8 +1320,10 @@ class WorkoutCog(commands.Cog):
             }
             self.bot.dispatch("pr_hit", payload)
             return (
-                f"🏆 PR! {format_standard_number(weight)}{unit} x {reps} "
-                f"(e1RM: {format_standard_number(e1rm)})"
+                f"🏆 NEW PR! {exercise_name} {format_standard_number(weight)} {unit} x {reps} "
+                f"(e1RM: {format_standard_number(e1rm)}) - Previous: "
+                f"{format_standard_number(prev_weight)} {existing.get('unit') or unit} x {prev_reps} "
+                f"(e1RM: {format_standard_number(prev_e1rm)}) on {existing.get('date') or 'previous session'}"
             )
         return None
 
@@ -1368,11 +1375,12 @@ class WorkoutCog(commands.Cog):
             return
 
         category = str(target.get("category") or "cable_machine")
+        equipment_type = str(target.get("equipment_type") or "").strip() or category.replace("_", " ")
         is_bodyweight = bool(parsed.get("is_bodyweight"))
         if is_bodyweight and category != "bodyweight":
             await send_discord_text(
                 channel,
-                f"{target['name']} is a {category.replace('_', ' ')} exercise - log a weight like `30 x 10`.",
+                f"{target['name']} is a {equipment_type} exercise - log a weight like `30 x 10`.",
             )
             return
         if category == "bodyweight" and not is_bodyweight:
@@ -1416,6 +1424,7 @@ class WorkoutCog(commands.Cog):
             str(unit),
             log_id,
             category,
+            equipment_type,
             user_id=session.user_id,
             performer_name=performer_name,
             performer_user_id=session.user_id,
@@ -1464,6 +1473,7 @@ class WorkoutCog(commands.Cog):
                 exercise_id=ex_id,
                 exercise_name=str(target["name"]),
                 category=category,
+                equipment_type=equipment_type,
                 weight=weight,
                 reps=reps,
                 unit=str(unit),
@@ -1851,6 +1861,7 @@ class WorkoutCog(commands.Cog):
                 unit=unit,
                 workout_log_id=ref.workout_log_id,
                 category=category,
+                equipment_type=ref.equipment_type,
                 user_id=self._session_key(after.author.id),
                 performer_name=getattr(after.author, "display_name", str(after.author)),
                 performer_user_id=self._session_key(after.author.id),

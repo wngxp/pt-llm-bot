@@ -53,6 +53,8 @@ class Database:
             await conn.executescript(schema)
             await self._migrate_user_state_table(conn)
             await self._ensure_multi_user_columns(conn)
+            await self._ensure_program_display_ids(conn)
+            await self._ensure_exercise_equipment_types(conn)
             system_tz = self._detect_system_timezone()
             await conn.execute(
                 """
@@ -177,6 +179,94 @@ class Database:
         await self._ensure_column_with_default(conn, table="exercise_cues", column="user_id")
         await self._ensure_column_with_default(conn, table="injuries", column="user_id")
         await self._ensure_column_with_default(conn, table="workout_sessions", column="user_id")
+
+    async def _ensure_program_display_ids(self, conn: aiosqlite.Connection) -> None:
+        rows = await self._fetchall(conn, "PRAGMA table_info(programs)")
+        columns = {str(r["name"]).lower() for r in rows}
+        if "display_id" not in columns:
+            await conn.execute("ALTER TABLE programs ADD COLUMN display_id INTEGER")
+
+        users = await self._fetchall(
+            conn,
+            """
+            SELECT DISTINCT user_id
+            FROM programs
+            WHERE user_id IS NOT NULL AND TRIM(user_id) != ''
+            ORDER BY user_id
+            """,
+        )
+        for row in users:
+            user_id = str(row["user_id"])
+            programs = await self._fetchall(
+                conn,
+                """
+                SELECT id, display_id
+                FROM programs
+                WHERE user_id = ?
+                ORDER BY COALESCE(created_at, ''), id
+                """,
+                (user_id,),
+            )
+            next_display_id = 1
+            for program in programs:
+                current = program["display_id"]
+                if current is None or int(current or 0) <= 0:
+                    await conn.execute(
+                        "UPDATE programs SET display_id = ? WHERE id = ?",
+                        (next_display_id, int(program["id"])),
+                    )
+                    next_display_id += 1
+                    continue
+                next_display_id = max(next_display_id, int(current) + 1)
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_programs_user_display_id ON programs(user_id, display_id)"
+        )
+
+    def _infer_equipment_type(self, name: str, category: str) -> str:
+        lowered = str(name or "").strip().lower()
+        normalized_category = str(category or "").strip().lower()
+        if "smith" in lowered or normalized_category == "smith_machine":
+            return "smith machine"
+        if normalized_category in {"heavy_barbell", "light_barbell"}:
+            return "barbell"
+        if normalized_category == "dumbbell" or any(token in lowered for token in ("dumbbell", "db ")):
+            return "dumbbell"
+        if normalized_category == "bodyweight" or any(
+            token in lowered for token in ("pull-up", "pull up", "chin-up", "chin up", "push-up", "push up", "dip")
+        ):
+            return "bodyweight"
+        if "cable" in lowered or any(token in lowered for token in ("press-around", "press around", "face pull")):
+            return "cable"
+        if any(
+            token in lowered
+            for token in ("machine", "pulldown", "lat pulldown", "leg press", "leg curl", "leg extension", "hack squat")
+        ):
+            return "machine"
+        return "unknown"
+
+    async def _ensure_exercise_equipment_types(self, conn: aiosqlite.Connection) -> None:
+        rows = await self._fetchall(conn, "PRAGMA table_info(exercises)")
+        columns = {str(r["name"]).lower() for r in rows}
+        if "equipment_type" not in columns:
+            await conn.execute("ALTER TABLE exercises ADD COLUMN equipment_type TEXT DEFAULT 'unknown'")
+
+        exercises = await self._fetchall(
+            conn,
+            """
+            SELECT id, name, category, equipment_type
+            FROM exercises
+            ORDER BY id
+            """,
+        )
+        for exercise in exercises:
+            current = str(exercise["equipment_type"] or "").strip().lower()
+            if current in {"barbell", "dumbbell", "cable", "machine", "bodyweight", "smith machine", "unknown"}:
+                continue
+            equipment_type = self._infer_equipment_type(str(exercise["name"] or ""), str(exercise["category"] or ""))
+            await conn.execute(
+                "UPDATE exercises SET equipment_type = ? WHERE id = ?",
+                (equipment_type, int(exercise["id"])),
+            )
 
     async def _ensure_user_state(
         self,
@@ -365,6 +455,7 @@ class Database:
             return {
                 "expired_program_name": str(temporary["name"]),
                 "parent_program_name": str(parent["name"]) if parent else None,
+                "parent_display_id": int(parent["display_id"]) if parent and parent["display_id"] is not None else None,
             }
 
     async def _revert_expired_temporary_program_if_needed(self, user_id: Optional[str | int] = None) -> None:
@@ -436,12 +527,18 @@ class Database:
         async with self.connect() as conn:
             await self._ensure_user_state(conn, normalized)
             await conn.execute("UPDATE programs SET active = 0 WHERE active = 1 AND user_id = ?", (normalized,))
+            display_id_row = await self._fetchone(
+                conn,
+                "SELECT COALESCE(MAX(display_id), 0) + 1 AS next_display_id FROM programs WHERE user_id = ?",
+                (normalized,),
+            )
+            display_id = int(display_id_row["next_display_id"] or 1) if display_id_row else 1
             cursor = await conn.execute(
                 """
-                INSERT INTO programs (user_id, name, active, temporary, parent_program_id, expires_at)
-                VALUES (?, ?, 1, ?, ?, ?)
+                INSERT INTO programs (user_id, display_id, name, active, temporary, parent_program_id, expires_at)
+                VALUES (?, ?, ?, 1, ?, ?, ?)
                 """,
-                (normalized, program_name, int(temporary), parent_program_id, expires_at),
+                (normalized, display_id, program_name, int(temporary), parent_program_id, expires_at),
             )
             program_id = cursor.lastrowid
 
@@ -459,8 +556,8 @@ class Database:
                         """
                         INSERT INTO exercises (
                             program_day_id, name, display_order, sets, rep_range_low,
-                            rep_range_high, category, superset_group, notes, muscle_groups
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            rep_range_high, category, equipment_type, superset_group, notes, muscle_groups
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             day_id,
@@ -470,6 +567,10 @@ class Database:
                             ex.get("rep_range_low"),
                             ex.get("rep_range_high"),
                             ex.get("category") or "cable_machine",
+                            ex.get("equipment_type") or self._infer_equipment_type(
+                                str(ex.get("name") or ""),
+                                str(ex.get("category") or ""),
+                            ),
                             ex.get("superset_group"),
                             ex.get("notes") or "",
                             ex.get("muscle_groups") or "",
@@ -482,6 +583,15 @@ class Database:
             )
             await conn.commit()
             return int(program_id)
+
+    async def get_program_by_id(self, program_id: int) -> Optional[dict[str, Any]]:
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                "SELECT * FROM programs WHERE id = ? LIMIT 1",
+                (program_id,),
+            )
+        return dict(row) if row else None
 
     async def get_recent_program_by_name(
         self,
@@ -1298,6 +1408,7 @@ class Database:
         user_id: Optional[str | int] = None,
         day_name_hint: Optional[str] = None,
         new_category: Optional[str] = None,
+        new_equipment_type: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         program = await self.get_active_program(user_id)
         if not program:
@@ -1313,6 +1424,7 @@ class Database:
                 conn,
                 f"""
                 SELECT e.id AS exercise_id, e.name AS exercise_name, e.category AS category, d.name AS day_name
+                     , e.equipment_type AS equipment_type
                 FROM exercises e
                 JOIN program_days d ON d.id = e.program_day_id
                 WHERE d.program_id = ?
@@ -1328,9 +1440,12 @@ class Database:
 
             ex_id = int(row["exercise_id"])
             next_category = str(new_category or row["category"] or "cable_machine")
+            next_equipment_type = str(
+                new_equipment_type or row["equipment_type"] or self._infer_equipment_type(new_name, next_category)
+            )
             await conn.execute(
-                "UPDATE exercises SET name = ?, category = ? WHERE id = ?",
-                (new_name, next_category, ex_id),
+                "UPDATE exercises SET name = ?, category = ?, equipment_type = ? WHERE id = ?",
+                (new_name, next_category, next_equipment_type, ex_id),
             )
             await conn.commit()
             return {
@@ -1339,6 +1454,7 @@ class Database:
                 "new_name": new_name,
                 "day_name": str(row["day_name"]),
                 "category": next_category,
+                "equipment_type": next_equipment_type,
             }
 
     async def rename_program_day_in_active_program(
