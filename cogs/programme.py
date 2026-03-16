@@ -28,6 +28,10 @@ SWAP_RE = re.compile(
     re.IGNORECASE,
 )
 CHANGE_RE = re.compile(r"change\s+(.+?)\s+to\s+(.+)$", re.IGNORECASE)
+INDEX_REF_RE = re.compile(
+    r"(?:(?:switch|change|set|update)\s+)?(?P<day>\d+)\.(?P<ex>\d+)\s+(?:to|is|should be)\s+(?:a\s+|an\s+)?(?P<target>.+)$",
+    re.IGNORECASE,
+)
 TYPE_CORRECTION_PATTERNS = [
     re.compile(
         r"^(?P<exercise>.+?)\s+(?:is|should be)\s+(?:a\s+|an\s+)?(?P<category>heavy[_ ]barbell|light[_ ]barbell|barbell|dumbbell|cable|machine|bodyweight|smith(?: machine)?)\b(?:.*)?$",
@@ -142,6 +146,11 @@ class ProgrammeCog(commands.Cog):
             "bw": "bodyweight",
             "body weight": "bodyweight",
             "db": "dumbbell",
+            "free weight": "barbell",
+            "bb": "barbell",
+            "cables": "cable",
+            "machines": "machine",
+            "mach": "machine",
         }
         return aliases.get(lowered, "unknown")
 
@@ -168,18 +177,58 @@ class ProgrammeCog(commands.Cog):
     def _exercise_type_from_name_and_category(self, exercise_name: str, category: str = "") -> str:
         lowered = exercise_name.lower()
         normalized_category = (category or "").strip().lower()
+
         if "smith" in lowered or normalized_category == "smith_machine":
             return "smith machine"
-        if any(token in lowered for token in ("pull-up", "pull up", "chin-up", "chin up", "push-up", "push up", "dip")):
+
+        bodyweight_tokens = (
+            "pull-up", "pull up", "pullup", "chin-up", "chin up", "chinup",
+            "push-up", "push up", "pushup", "dip", "diamond pushup",
+            "leg raise", "hanging raise", "plank", "crunch", "sit-up",
+            "sit up", "burpee", "lunge walk", "bodyweight", "bw ",
+            "pistol squat", "muscle-up", "muscle up",
+        )
+        if any(token in lowered for token in bodyweight_tokens) or normalized_category == "bodyweight":
             return "bodyweight"
-        if normalized_category == "bodyweight":
-            return "bodyweight"
-        if any(token in lowered for token in ("dumbbell", "db ", "db-")) or normalized_category == "dumbbell":
+
+        dumbbell_tokens = (
+            "dumbbell", "db ", "db-", "arnold press", "kroc",
+            "hammer curl", "cross-body curl", "cross body curl",
+            "concentration curl", "incline curl",
+            "lateral raise", "front raise", "rear delt fly",
+            "dumbbell row", "db row",
+            "goblet squat", "dumbbell lunge", "walking lunge",
+        )
+        if any(token in lowered for token in dumbbell_tokens) or normalized_category == "dumbbell":
             return "dumbbell"
-        if any(token in lowered for token in ("cable", "press-around", "press around", "face pull")):
+
+        cable_tokens = (
+            "cable", "press-around", "press around", "face pull",
+            "tricep pushdown", "pushdown", "overhead extension",
+            "cross-body tricep", "cross body tricep",
+            "cable fly", "cable crossover", "cable curl",
+            "cable row", "cable pullover", "cable lateral",
+            "rope", "v-bar", "straight bar curl",
+        )
+        if any(token in lowered for token in cable_tokens):
             return "cable"
-        if any(token in lowered for token in ("machine", "pulldown", "lat pulldown", "leg press", "leg curl", "leg extension", "hack squat")):
+
+        machine_tokens = (
+            "machine", "pulldown", "lat pulldown", "lat pull-down",
+            "leg press", "leg curl", "leg extension",
+            "hack squat", "hip thrust", "seated row",
+            "chest fly machine", "pec deck", "pec fly",
+            "shoulder press machine", "smith",
+            "seated calf", "toe press", "calf raise machine",
+            "hip abduct", "hip adduct", "glute drive",
+            "assisted", "preacher curl machine",
+        )
+        if any(token in lowered for token in machine_tokens):
             return "machine"
+
+        if "ez-bar" in lowered or "ez bar" in lowered or "preacher curl" in lowered:
+            return "barbell"
+
         if normalized_category in {"heavy_barbell", "light_barbell"}:
             return "barbell"
         return "unknown"
@@ -271,6 +320,11 @@ class ProgrammeCog(commands.Cog):
                     equipment_type,
                     fallback=str(exercise.get("category") or ""),
                 )
+                if equipment_type == "unknown":
+                    inferred = self._exercise_type_from_name_and_category(name, str(exercise.get("category") or ""))
+                    if inferred != "unknown":
+                        equipment_type = self._normalize_equipment_type(inferred)
+                        category = self._db_category_from_equipment_type(name, equipment_type)
                 out_exercises.append(
                     {
                         "name": name,
@@ -846,6 +900,84 @@ class ProgrammeCog(commands.Cog):
         )
         return True
 
+    async def _handle_index_based_correction(
+        self,
+        channel: discord.abc.Messageable,
+        text: str,
+        *,
+        user_id: str,
+    ) -> bool:
+        match = INDEX_REF_RE.match(text.strip())
+        if not match:
+            return False
+
+        day_num = int(match.group("day"))
+        ex_num = int(match.group("ex"))
+        target = str(match.group("target") or "").strip().rstrip(".")
+
+        program = await self.db.get_active_program(user_id)
+        if not program:
+            await send_discord_text(channel, "No active program.")
+            return True
+
+        days = await self.db.get_program_days(int(program["id"]))
+        if day_num < 1 or day_num > len(days):
+            await send_discord_text(channel, f"Day {day_num} doesn't exist. Program has {len(days)} days.")
+            return True
+
+        day = days[day_num - 1]
+        exercises = await self.db.get_exercises_for_day(int(day["id"]))
+        if ex_num < 1 or ex_num > len(exercises):
+            await send_discord_text(
+                channel,
+                f"Exercise {ex_num} doesn't exist on {day['name']}. It has {len(exercises)} exercises.",
+            )
+            return True
+
+        exercise = exercises[ex_num - 1]
+        exercise_name = str(exercise["name"])
+        normalized_target = self._normalize_equipment_type(target)
+        if normalized_target != "unknown":
+            updated = await self.db.update_exercise_category(
+                exercise_name=exercise_name,
+                new_category=normalized_target,
+                user_id=user_id,
+            )
+            if updated:
+                await send_discord_text(
+                    channel,
+                    f"✅ Updated {updated['exercise_name']} (Day {day_num}.{ex_num}) from `{updated['old_category']}` -> `{updated['new_category']}`.",
+                )
+            else:
+                await send_discord_text(channel, f"Failed to update {exercise_name}.")
+            return True
+
+        new_equip = self._exercise_type_from_name_and_category(target, "")
+        if new_equip == "unknown":
+            self.pending_exercise_type_prompts[self._pending_key(int(user_id), getattr(channel, "id", 0))] = PendingExerciseTypePrompt(
+                user_id=int(user_id),
+                channel_id=getattr(channel, "id", 0),
+                old_name=exercise_name,
+                new_name=target,
+                day_hint=str(day["name"]),
+                created_at=self._now_utc(),
+            )
+            await send_discord_text(
+                channel,
+                f"Swapping **{exercise_name}** -> **{target}** on {day['name']}. What type is {target}? (`barbell`, `dumbbell`, `cable`, `machine`, `bodyweight`, `smith machine`)",
+            )
+            return True
+
+        await self._apply_active_swap(
+            channel,
+            user_id=user_id,
+            old_name=exercise_name,
+            new_name=target,
+            day_hint=str(day["name"]),
+            equipment_type=new_equip,
+        )
+        return True
+
     async def _handle_type_correction_request(
         self,
         channel: discord.abc.Messageable,
@@ -1172,6 +1304,9 @@ class ProgrammeCog(commands.Cog):
                 if context:
                     self._clear_post_import_context(user_id, channel_id)
                     await send_discord_text(message.channel, "Program saved and ready. Head to your workout channel and type `ready` to start.")
+                return
+
+            if await self._handle_index_based_correction(message.channel, content, user_id=str(user_id)):
                 return
 
             if await self._handle_type_correction_request(message.channel, content, user_id=str(user_id)):
