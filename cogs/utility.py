@@ -8,7 +8,144 @@ from discord.ext import commands
 from utils.discord_messages import send_discord_text
 
 
-BOT_VERSION = "0.6.1"
+BOT_VERSION = "0.6.2"
+HELP_ENTRIES = {
+    "help": {
+        "syntax": "!help [command]",
+        "description": "Show the command list or detailed help for one command.",
+        "channel": "Any channel",
+    },
+    "version": {
+        "syntax": "!version",
+        "description": "Show the current bot version.",
+        "channel": "Any channel",
+    },
+    "timezone": {
+        "syntax": "!timezone <tz>",
+        "description": "Set your timezone, for example `!timezone Asia/Shanghai`.",
+        "channel": "#activity or utility channel",
+    },
+    "volume": {
+        "syntax": "!volume",
+        "description": "Show weekly set volume by muscle group.",
+        "channel": "Workout channels",
+    },
+    "e1rm": {
+        "syntax": "!e1rm <exercise>",
+        "description": "Show estimated 1RM history for an exercise.",
+        "channel": "Workout channels",
+    },
+    "export": {
+        "syntax": "!export [exercise]",
+        "description": "Export all workout logs, or one exercise, as CSV.",
+        "channel": "Workout channels",
+    },
+    "plates": {
+        "syntax": "!plates <weight> [kg|lbs]",
+        "description": "Show a plate breakdown for a target weight.",
+        "channel": "Workout channels",
+    },
+    "cue": {
+        "syntax": "!cue <exercise> <text>",
+        "description": "Save a personal lifting cue for an exercise.",
+        "channel": "Workout channels",
+    },
+    "reset": {
+        "syntax": "!reset confirm",
+        "description": "Wipe workout data after a 60-second confirmation window.",
+        "channel": "Admin/utility channel",
+    },
+    "summary": {
+        "syntax": "!summary",
+        "description": "Generate a weekly check-in summary.",
+        "channel": "#check-in",
+    },
+    "checkin": {
+        "syntax": "!checkin",
+        "description": "Generate the current weekly check-in summary.",
+        "channel": "#check-in",
+    },
+    "import": {
+        "syntax": "!import <program text>",
+        "description": "Start a programme import preview in #programme.",
+        "channel": "#programme",
+    },
+    "program": {
+        "syntax": "!program",
+        "description": "Show your active program with day-by-day exercise details.",
+        "channel": "#programme",
+    },
+    "startday": {
+        "syntax": "!startday <day name or number>",
+        "description": "Set the day you want to start from after importing or editing a program.",
+        "channel": "#programme",
+    },
+    "travel": {
+        "syntax": "!travel <constraints>",
+        "description": "Draft a temporary travel version of the active program.",
+        "channel": "#programme",
+    },
+    "start": {
+        "syntax": "!start",
+        "description": "Start today's workout session in the current weekday channel.",
+        "channel": "Workout channels",
+    },
+    "done": {
+        "syntax": "!done",
+        "description": "Finish the current workout session immediately.",
+        "channel": "Workout channels",
+    },
+    "skipday": {
+        "syntax": "!skipday <day name or number>",
+        "description": "Skip ahead to a different program day.",
+        "channel": "Workout channels",
+    },
+    "goto": {
+        "syntax": "!goto <day name or number>",
+        "description": "Jump to a different program day.",
+        "channel": "Workout channels",
+    },
+    "activity": {
+        "syntax": "!activity <description>",
+        "description": "Log an activity with recovery impact tracking.",
+        "channel": "#activity",
+    },
+    "readiness": {
+        "syntax": "!readiness <1-10>",
+        "description": "Set your readiness score for training suggestions.",
+        "channel": "#activity",
+    },
+    "phase": {
+        "syntax": "!phase <cut|bulk|maintain>",
+        "description": "Set your current training phase.",
+        "channel": "#activity",
+    },
+    "prs": {
+        "syntax": "!prs [days]",
+        "description": "Show recently logged PR entries.",
+        "channel": "#prs or utility channel",
+    },
+    "debug": {
+        "syntax": "!debug",
+        "description": "Show current state and active program info.",
+        "channel": "Admin/utility channel",
+    },
+    "setday": {
+        "syntax": "!setday <n>",
+        "description": "Force the current program day index.",
+        "channel": "Admin/utility channel",
+    },
+    "deleteprogram": {
+        "syntax": "!deleteprogram confirm",
+        "description": "Delete the active program after confirmation.",
+        "channel": "Admin/utility channel",
+    },
+    "ask": {
+        "syntax": "!ask <question>",
+        "description": "Ask a fitness question in command form.",
+        "channel": "#ask",
+    },
+}
 
 
 class UtilityCog(commands.Cog):
@@ -146,48 +283,87 @@ class UtilityCog(commands.Cog):
         await send_discord_text(ctx.channel, f"PT-LLM Bot v{BOT_VERSION}")
         await self._maybe_send_tip(ctx.channel)
 
-    @commands.command(name="help", aliases=["pthelp"])
-    async def help_command(self, ctx: commands.Context) -> None:
-        lines = [
-            "**PT-LLM Command Guide**",
-            "",
-            "**Workout**",
-            "- `ready` - start today's workout",
-            "- `[weight] x [reps]` - log a set (for example `225 x 3`, `80 kg x 5`, `bw x 10`, `bw+25 x 8`)",
-            "- `@[rir]` - add RIR after a set (for example `225 x 3 @1`)",
-            "- `skip rest` - skip the rest timer",
-            "- `im done` / `stop` - end session early",
-            "- `resume` / `move on` - after ending early",
-            "",
-            "**Program**",
-            "- Paste a program in `#programme` to import (bot will discuss first)",
-            "- `save` - confirm and import after discussion",
-            "- `cancel` - discard pending program",
-            "",
-            "**Stats**",
-            "- `!volume` - weekly sets per muscle group",
-            "- `!e1rm [exercise]` - estimated 1RM history",
-            "- `!plates [weight]` - plate breakdown",
-            "- `!export` - download training logs as CSV",
-            "",
-            "**Settings**",
-            "- `!timezone [tz]` - set timezone (for example `!timezone Asia/Shanghai`)",
-            "- `!cue [exercise] [text]` - save a form cue",
-            "",
-            "**Admin**",
-            "- `!reset` - wipe all workout data (with confirmation)",
-            "- `!deleteprogram` - delete current program",
-            "- `!setday [n]` - set current day index",
-            "- `!skipday [n]` - skip to a specific program day",
-            "- `!debug` - show current bot state",
-            "- `!version` - show bot version",
-            "",
-            "**Info**",
-            "- `!help` - show this command list",
-            "- `!summary` / `!checkin` - weekly summary (in `#check-in`)",
-            "- `#coach` - opinionated coaching and program design (say `import this` to hand off to `#programme`)",
-        ]
-        await send_discord_text(ctx.channel, "\n".join(lines))
+    @commands.command(name="help", aliases=["pthelp", "commands"])
+    async def help_command(self, ctx: commands.Context, *, command_name: str = "") -> None:
+        normalized = command_name.strip().lower().lstrip("!")
+        if normalized:
+            entry = HELP_ENTRIES.get(normalized)
+            if entry is None:
+                await send_discord_text(ctx.channel, f"No help entry for `{command_name.strip()}`. Try `!help`.")
+                return
+            embed = discord.Embed(
+                title=f"!{normalized}",
+                description=entry["description"],
+                color=discord.Color.blue(),
+            )
+            embed.add_field(name="Syntax", value=entry["syntax"], inline=False)
+            embed.add_field(name="Where", value=entry["channel"], inline=False)
+            embed.set_footer(text="See COMMANDS.md in the repo root for the full user manual.")
+            await ctx.channel.send(embed=embed)
+            await self._maybe_send_tip(ctx.channel)
+            return
+
+        embed = discord.Embed(
+            title="PT-LLM Command Guide",
+            description="Hard commands are listed below. I also understand natural language in the channel where you use me.",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="Workout",
+            value=(
+                "`!start` start today's workout\n"
+                "`!done` finish the current session\n"
+                "`!skipday` / `!goto` change the queued program day\n"
+                "`!plates` plate math\n"
+                "`!e1rm` estimated 1RM history\n"
+                "`!volume` weekly volume\n"
+                "`!cue` save a cue\n"
+                "`!export` export logs"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Programme",
+            value=(
+                "`!import` preview a pasted program\n"
+                "`!program` show the active program\n"
+                "`!startday` choose the starting day\n"
+                "`!travel` draft a temporary travel program\n"
+                "`!deleteprogram` delete the active program"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Check-In / Activity",
+            value=(
+                "`!checkin` / `!summary` weekly summary\n"
+                "`!activity` log outside activity\n"
+                "`!readiness` set readiness\n"
+                "`!phase` set cut/bulk/maintain\n"
+                "`!timezone` set timezone"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Utility / Admin",
+            value=(
+                "`!help` command guide\n"
+                "`!version` bot version\n"
+                "`!prs` recent PRs\n"
+                "`!ask` command-style question\n"
+                "`!debug` admin state dump\n"
+                "`!setday` admin day override\n"
+                "`!reset` reset workout data"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Natural Language",
+            value="Try `what exercises do I have left?`, `same`, `switch to dumbbell`, or `show my program`.",
+            inline=False,
+        )
+        embed.set_footer(text="Use !help <command> for details. Full manual: COMMANDS.md in the repo root.")
+        await ctx.channel.send(embed=embed)
         await self._maybe_send_tip(ctx.channel)
 
     @commands.command(name="debug")

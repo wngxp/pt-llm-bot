@@ -55,6 +55,7 @@ class Database:
             await self._ensure_multi_user_columns(conn)
             await self._ensure_program_display_ids(conn)
             await self._ensure_exercise_equipment_types(conn)
+            await self._ensure_workout_log_snapshot_columns(conn)
             system_tz = self._detect_system_timezone()
             await conn.execute(
                 """
@@ -267,6 +268,92 @@ class Database:
                 "UPDATE exercises SET equipment_type = ? WHERE id = ?",
                 (equipment_type, int(exercise["id"])),
             )
+
+    async def _ensure_workout_log_snapshot_columns(self, conn: aiosqlite.Connection) -> None:
+        rows = await self._fetchall(conn, "PRAGMA table_info(workout_logs)")
+        columns = {str(r["name"]).lower() for r in rows}
+        if "performed_exercise_name" not in columns:
+            await conn.execute("ALTER TABLE workout_logs ADD COLUMN performed_exercise_name TEXT")
+        if "performed_category" not in columns:
+            await conn.execute("ALTER TABLE workout_logs ADD COLUMN performed_category TEXT")
+        if "performed_equipment_type" not in columns:
+            await conn.execute("ALTER TABLE workout_logs ADD COLUMN performed_equipment_type TEXT")
+
+    def _category_label_from_storage(self, category: str, equipment_type: str) -> str:
+        normalized_category = str(category or "").strip().lower()
+        normalized_type = str(equipment_type or "").strip().lower()
+        if normalized_type == "smith machine" or normalized_category == "smith_machine":
+            return "smith"
+        if normalized_type == "machine":
+            return "machine"
+        if normalized_type == "cable":
+            return "cable"
+        if normalized_type == "dumbbell" or normalized_category == "dumbbell":
+            return "dumbbell"
+        if normalized_type == "bodyweight" or normalized_category == "bodyweight":
+            return "bodyweight"
+        if normalized_category in {"heavy_barbell", "light_barbell"}:
+            return normalized_category
+        return normalized_type or normalized_category or "unknown"
+
+    def _normalize_requested_category(
+        self,
+        exercise_name: str,
+        requested: str,
+        *,
+        current_category: str = "",
+    ) -> Optional[str]:
+        lowered = " ".join(str(requested or "").strip().lower().split())
+        if not lowered:
+            return None
+        aliases = {
+            "bw": "bodyweight",
+            "body weight": "bodyweight",
+            "db": "dumbbell",
+            "smith machine": "smith",
+            "smith": "smith",
+            "heavy barbell": "heavy_barbell",
+            "light barbell": "light_barbell",
+        }
+        normalized = aliases.get(lowered, lowered.replace(" ", "_"))
+        if normalized in {"dumbbell", "cable", "machine", "smith", "bodyweight", "heavy_barbell", "light_barbell"}:
+            return normalized
+        if normalized == "barbell":
+            current = str(current_category or "").strip().lower()
+            if current in {"heavy_barbell", "light_barbell"}:
+                return current
+            inferred = self._infer_equipment_type(exercise_name, current)
+            if inferred == "barbell":
+                lowered_name = exercise_name.strip().lower()
+                heavy_tokens = ("squat", "bench", "deadlift", "overhead press", "ohp", "barbell row")
+                return "heavy_barbell" if any(token in lowered_name for token in heavy_tokens) else "light_barbell"
+        return None
+
+    def _storage_category_and_equipment(
+        self,
+        exercise_name: str,
+        requested_category: str,
+        *,
+        current_category: str = "",
+    ) -> tuple[str, str]:
+        normalized = self._normalize_requested_category(
+            exercise_name,
+            requested_category,
+            current_category=current_category,
+        )
+        if normalized == "heavy_barbell":
+            return "heavy_barbell", "barbell"
+        if normalized == "light_barbell":
+            return "light_barbell", "barbell"
+        if normalized == "dumbbell":
+            return "dumbbell", "dumbbell"
+        if normalized == "bodyweight":
+            return "bodyweight", "bodyweight"
+        if normalized == "smith":
+            return "smith_machine", "smith machine"
+        if normalized == "machine":
+            return "cable_machine", "machine"
+        return "cable_machine", "cable"
 
     async def _ensure_user_state(
         self,
@@ -679,14 +766,82 @@ class Database:
         async with self.connect() as conn:
             rows = await self._fetchall(conn, 
                 """
-                SELECT *
-                FROM workout_logs
-                WHERE exercise_id = ?
-                  AND user_id = ?
-                ORDER BY date DESC, set_number DESC
+                SELECT wl.*,
+                       COALESCE(wl.performed_exercise_name, e.name) AS logged_exercise_name,
+                       COALESCE(wl.performed_category, e.category) AS logged_category,
+                       COALESCE(wl.performed_equipment_type, e.equipment_type) AS logged_equipment_type
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE wl.exercise_id = ?
+                  AND wl.user_id = ?
+                  AND LOWER(COALESCE(wl.performed_exercise_name, e.name)) = LOWER(e.name)
+                ORDER BY wl.date DESC, wl.set_number DESC
                 LIMIT ?
                 """,
                 (exercise_id, normalized, limit),
+            )
+        return [dict(r) for r in rows]
+
+    async def get_last_logs_for_named_exercise(
+        self,
+        exercise_name: str,
+        *,
+        limit: int = 6,
+        user_id: Optional[str | int] = None,
+    ) -> list[dict[str, Any]]:
+        normalized = self._normalize_user_id(user_id)
+        async with self.connect() as conn:
+            rows = await self._fetchall(
+                conn,
+                """
+                SELECT wl.*,
+                       COALESCE(wl.performed_exercise_name, e.name) AS logged_exercise_name,
+                       COALESCE(wl.performed_category, e.category) AS logged_category,
+                       COALESCE(wl.performed_equipment_type, e.equipment_type) AS logged_equipment_type
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE LOWER(COALESCE(wl.performed_exercise_name, e.name)) = LOWER(?)
+                  AND wl.user_id = ?
+                ORDER BY wl.date DESC, wl.set_number DESC
+                LIMIT ?
+                """,
+                (exercise_name, normalized, limit),
+            )
+        return [dict(r) for r in rows]
+
+    async def get_recent_sessions_for_named_exercise(
+        self,
+        exercise_name: str,
+        *,
+        limit: int = 5,
+        user_id: Optional[str | int] = None,
+    ) -> list[dict[str, Any]]:
+        normalized = self._normalize_user_id(user_id)
+        async with self.connect() as conn:
+            rows = await self._fetchall(
+                conn,
+                """
+                SELECT wl.date,
+                       GROUP_CONCAT(
+                           CASE
+                               WHEN COALESCE(wl.performed_category, e.category) = 'bodyweight'
+                                   THEN CASE
+                                       WHEN TRIM(COALESCE(wl.notes, '')) = '' THEN 'bw x ' || wl.reps
+                                       ELSE COALESCE(wl.notes, 'bodyweight') || ' x ' || wl.reps
+                                   END
+                               ELSE printf('%g %s x %d', wl.weight, wl.unit, wl.reps)
+                           END,
+                           ', '
+                       ) AS sets_summary
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE LOWER(COALESCE(wl.performed_exercise_name, e.name)) = LOWER(?)
+                  AND wl.user_id = ?
+                GROUP BY wl.date
+                ORDER BY wl.date DESC
+                LIMIT ?
+                """,
+                (exercise_name, normalized, limit),
             )
         return [dict(r) for r in rows]
 
@@ -702,15 +857,34 @@ class Database:
         unit: str,
         rir: Optional[int] = None,
         notes: str = "",
+        performed_exercise_name: Optional[str] = None,
+        performed_category: Optional[str] = None,
+        performed_equipment_type: Optional[str] = None,
     ) -> int:
         normalized = self._normalize_user_id(user_id)
         async with self.connect() as conn:
             cursor = await conn.execute(
                 """
-                INSERT INTO workout_logs (user_id, exercise_id, date, set_number, weight, reps, unit, rir, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO workout_logs (
+                    user_id, exercise_id, performed_exercise_name, performed_category, performed_equipment_type,
+                    date, set_number, weight, reps, unit, rir, notes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (normalized, exercise_id, workout_date.isoformat(), set_number, weight, reps, unit, rir, notes),
+                (
+                    normalized,
+                    exercise_id,
+                    performed_exercise_name,
+                    performed_category,
+                    performed_equipment_type,
+                    workout_date.isoformat(),
+                    set_number,
+                    weight,
+                    reps,
+                    unit,
+                    rir,
+                    notes,
+                ),
             )
             log_id = cursor.lastrowid
             await conn.commit()
@@ -868,7 +1042,7 @@ class Database:
         async with self.connect() as conn:
             rows = await self._fetchall(conn, 
                 """
-                SELECT e.name AS exercise_name, wl.*
+                SELECT COALESCE(wl.performed_exercise_name, e.name) AS exercise_name, wl.*
                 FROM workout_logs wl
                 JOIN exercises e ON e.id = wl.exercise_id
                 WHERE e.program_day_id = ?
@@ -1075,7 +1249,7 @@ class Database:
                        (wl.weight * (1 + wl.reps / 30.0)) AS e1rm
                 FROM workout_logs wl
                 JOIN exercises e ON e.id = wl.exercise_id
-                WHERE LOWER(e.name) = LOWER(?)
+                WHERE LOWER(COALESCE(wl.performed_exercise_name, e.name)) = LOWER(?)
                   AND wl.user_id = ?
                 ORDER BY wl.date ASC, wl.set_number ASC
                 LIMIT ?
@@ -1101,7 +1275,7 @@ class Database:
                 rows = await self._fetchall(conn, 
                     """
                     SELECT wl.date,
-                           e.name AS exercise,
+                           COALESCE(wl.performed_exercise_name, e.name) AS exercise,
                            wl.set_number,
                            wl.weight,
                            wl.unit,
@@ -1111,7 +1285,7 @@ class Database:
                            wl.notes
                     FROM workout_logs wl
                     JOIN exercises e ON e.id = wl.exercise_id
-                    WHERE LOWER(e.name) = LOWER(?)
+                    WHERE LOWER(COALESCE(wl.performed_exercise_name, e.name)) = LOWER(?)
                       AND wl.user_id = ?
                     ORDER BY wl.date, e.name, wl.set_number
                     """,
@@ -1121,7 +1295,7 @@ class Database:
                 rows = await self._fetchall(conn, 
                     """
                     SELECT wl.date,
-                           e.name AS exercise,
+                           COALESCE(wl.performed_exercise_name, e.name) AS exercise,
                            wl.set_number,
                            wl.weight,
                            wl.unit,
@@ -1148,13 +1322,13 @@ class Database:
             exact = await self._fetchone(
                 conn,
                 """
-                SELECT e.name AS name, COUNT(*) AS cnt
+                SELECT COALESCE(wl.performed_exercise_name, e.name) AS name, COUNT(*) AS cnt
                 FROM workout_logs wl
                 JOIN exercises e ON e.id = wl.exercise_id
-                WHERE LOWER(e.name) = LOWER(?)
+                WHERE LOWER(COALESCE(wl.performed_exercise_name, e.name)) = LOWER(?)
                   AND wl.user_id = ?
-                GROUP BY e.name
-                ORDER BY cnt DESC, LENGTH(e.name) ASC
+                GROUP BY COALESCE(wl.performed_exercise_name, e.name)
+                ORDER BY cnt DESC, LENGTH(name) ASC
                 LIMIT 1
                 """,
                 (cleaned, normalized),
@@ -1166,13 +1340,13 @@ class Database:
             partial = await self._fetchone(
                 conn,
                 """
-                SELECT e.name AS name, COUNT(*) AS cnt
+                SELECT COALESCE(wl.performed_exercise_name, e.name) AS name, COUNT(*) AS cnt
                 FROM workout_logs wl
                 JOIN exercises e ON e.id = wl.exercise_id
-                WHERE LOWER(e.name) LIKE ?
+                WHERE LOWER(COALESCE(wl.performed_exercise_name, e.name)) LIKE ?
                   AND wl.user_id = ?
-                GROUP BY e.name
-                ORDER BY cnt DESC, LENGTH(e.name) ASC
+                GROUP BY COALESCE(wl.performed_exercise_name, e.name)
+                ORDER BY cnt DESC, LENGTH(name) ASC
                 LIMIT 1
                 """,
                 (like, normalized),
@@ -1371,6 +1545,75 @@ class Database:
                 (program["id"], name),
             )
         return dict(row) if row else None
+
+    async def update_exercise_category(
+        self,
+        exercise_name: str,
+        new_category: str,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+
+        async with self.connect() as conn:
+            rows = await self._fetchall(
+                conn,
+                """
+                SELECT e.id, e.name, e.category, e.equipment_type
+                FROM exercises e
+                JOIN program_days d ON d.id = e.program_day_id
+                WHERE d.program_id = ?
+                  AND LOWER(e.name) = LOWER(?)
+                ORDER BY d.day_order, e.display_order
+                """,
+                (int(program["id"]), exercise_name),
+            )
+            if not rows:
+                rows = await self._fetchall(
+                    conn,
+                    """
+                    SELECT e.id, e.name, e.category, e.equipment_type
+                    FROM exercises e
+                    JOIN program_days d ON d.id = e.program_day_id
+                    WHERE d.program_id = ?
+                      AND LOWER(e.name) LIKE ?
+                    ORDER BY LENGTH(e.name), d.day_order, e.display_order
+                    """,
+                    (int(program["id"]), f"%{exercise_name.strip().lower()}%"),
+                )
+            if not rows:
+                return None
+
+            target_name = str(rows[0]["name"])
+            old_category = self._category_label_from_storage(str(rows[0]["category"] or ""), str(rows[0]["equipment_type"] or ""))
+            db_category, equipment_type = self._storage_category_and_equipment(
+                target_name,
+                new_category,
+                current_category=str(rows[0]["category"] or ""),
+            )
+            cursor = await conn.execute(
+                """
+                UPDATE exercises
+                SET category = ?, equipment_type = ?
+                WHERE id IN (
+                    SELECT e.id
+                    FROM exercises e
+                    JOIN program_days d ON d.id = e.program_day_id
+                    WHERE d.program_id = ?
+                      AND LOWER(e.name) = LOWER(?)
+                )
+                """,
+                (db_category, equipment_type, int(program["id"]), target_name),
+            )
+            await conn.commit()
+        return {
+            "exercise_name": target_name,
+            "old_category": old_category,
+            "new_category": self._category_label_from_storage(db_category, equipment_type),
+            "updated_rows": int(cursor.rowcount or 0),
+        }
 
     async def update_exercise_name_in_active_program(
         self,

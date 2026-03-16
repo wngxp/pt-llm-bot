@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from datetime import datetime
 
 if "discord" not in sys.modules:
     discord_module = types.ModuleType("discord")
@@ -48,7 +49,7 @@ if "discord" not in sys.modules:
     sys.modules["discord.ext.commands"] = commands_module
 
 from cogs.programme import ProgrammeCog
-from cogs.workout import WorkoutCog
+from cogs.workout import WorkoutCog, WorkoutSession
 
 
 class _DummySettings:
@@ -97,14 +98,78 @@ class ProgrammeAndPRTests(unittest.TestCase):
     def test_pr_announcements_are_limited_to_sbd_variations(self) -> None:
         cog = WorkoutCog(_DummyBot())
 
-        self.assertTrue(cog._is_pr_announce_exercise("Bench Press", "barbell"))
-        self.assertTrue(cog._is_pr_announce_exercise("Pause Squat", "barbell"))
-        self.assertTrue(cog._is_pr_announce_exercise("Smith Machine Bench Press", "smith machine"))
-        self.assertTrue(cog._is_pr_announce_exercise("Sumo Deadlift", "barbell"))
-        self.assertFalse(cog._is_pr_announce_exercise("Dumbbell Bench Press", "dumbbell"))
-        self.assertFalse(cog._is_pr_announce_exercise("Pull-Ups", "bodyweight"))
-        self.assertFalse(cog._is_pr_announce_exercise("Hack Squat", "machine"))
-        self.assertFalse(cog._is_pr_announce_exercise("Bulgarian Split Squat", "barbell"))
+        self.assertTrue(cog._is_pr_announce_exercise("Bench Press", "heavy_barbell", "barbell"))
+        self.assertTrue(cog._is_pr_announce_exercise("Pause Squat", "heavy_barbell", "barbell"))
+        self.assertTrue(cog._is_pr_announce_exercise("Sumo Deadlift", "heavy_barbell", "barbell"))
+        self.assertFalse(cog._is_pr_announce_exercise("Smith Machine Bench Press", "heavy_barbell", "smith machine"))
+        self.assertFalse(cog._is_pr_announce_exercise("Dumbbell Bench Press", "dumbbell", "dumbbell"))
+        self.assertFalse(cog._is_pr_announce_exercise("Pull-Ups", "bodyweight", "bodyweight"))
+        self.assertFalse(cog._is_pr_announce_exercise("Hack Squat", "heavy_barbell", "barbell"))
+        self.assertFalse(cog._is_pr_announce_exercise("Bulgarian Split Squat", "heavy_barbell", "barbell"))
+
+    def test_programme_detects_show_program_intent(self) -> None:
+        cog = ProgrammeCog(_DummyBot())
+
+        self.assertTrue(cog._looks_like_show_program_intent("show my program"))
+        self.assertTrue(cog._looks_like_show_program_intent("what's my current program?"))
+        self.assertFalse(cog._looks_like_show_program_intent("save program"))
+
+    def test_programme_extracts_type_correction(self) -> None:
+        cog = ProgrammeCog(_DummyBot())
+
+        self.assertEqual(cog._extract_type_correction("leg raises is bodyweight not cable"), ("leg raises", "bodyweight"))
+        self.assertEqual(cog._extract_type_correction("change smith deadlift to smith machine"), ("smith deadlift", "smith machine"))
+
+    def test_same_command_reuses_previous_set(self) -> None:
+        cog = WorkoutCog(_DummyBot())
+        session = WorkoutSession(
+            user_id="1",
+            channel_id=1,
+            day_index=0,
+            day={"name": "Push"},
+            exercises=[{"id": 10, "name": "Bench Press", "sets": 4}],
+            started_at=datetime.now(),
+            set_counts={10: 2},
+            total_exercises=1,
+            logged_sets=[
+                {
+                    "workout_log_id": 1,
+                    "exercise_id": 10,
+                    "exercise_name": "Bench Press",
+                    "weight": 185.0,
+                    "reps": 5,
+                    "unit": "lbs",
+                    "e1rm": 215.8,
+                    "is_bodyweight": False,
+                    "note": "",
+                }
+            ],
+        )
+
+        parsed, error = cog._parse_same_command(session, "same -5")
+        self.assertIsNone(error)
+        assert parsed is not None
+        self.assertEqual(parsed["weight"], 180.0)
+        self.assertEqual(parsed["reps"], 5)
+
+    def test_shorthand_set_requires_existing_context(self) -> None:
+        cog = WorkoutCog(_DummyBot())
+        session = WorkoutSession(
+            user_id="1",
+            channel_id=1,
+            day_index=0,
+            day={"name": "Push"},
+            exercises=[{"id": 10, "name": "Bench Press", "sets": 4}],
+            started_at=datetime.now(),
+            set_counts={10: 1},
+            total_exercises=1,
+        )
+
+        parsed = cog._parse_shorthand_set(session, "100 8 2")
+        assert parsed is not None
+        self.assertEqual(parsed["weight"], 100.0)
+        self.assertEqual(parsed["reps"], 8)
+        self.assertEqual(parsed["rir"], 2)
 
 
 if __name__ == "__main__":

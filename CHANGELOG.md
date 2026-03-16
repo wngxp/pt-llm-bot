@@ -1,3 +1,17 @@
+## [0.6.2] - 2026-03-16
+### Fixed
+- Discord long-form replies now split on paragraph and sentence boundaries with a 1900-character safety buffer, preventing silent truncation in `#coach`, `#check-in`, `#programme`, and other LLM-driven channels.
+- `#programme` now recognizes `show/list/current program` requests and prints the active program from the database instead of falling back to the import prompt.
+- Users can now correct imported exercise categories in `#programme` with natural language like `leg raises is bodyweight` or `smith deadlift is smith machine`, and those fixes flow through to later workout behavior.
+- PR announcements now require true `heavy_barbell` SBD patterns plus non-Smith barbell equipment, which blocks false PR callouts for Smith variants and other non-qualifying lifts.
+- Workout logging now accepts shorthand after the first set (`100 8`, `100 8 2`) and `same` variants (`same`, `same 6`, `same -5`) without breaking unit context.
+- Rest timer updates now preview the next exercise on the final set so users can set up equipment during the rest period.
+
+### Added
+- Session-only workout overrides for equipment switching (`switch to dumbbell`, `use smith machine`) and mid-session exercise reordering (`do lateral raises next`).
+- Inline workout queries for remaining exercises, current-exercise history, and PR lookups, followed by a reminder of the current set context.
+- A repo-root `COMMANDS.md` user manual and a new embed-based `!help [command]` / `!commands` flow.
+
 ## [0.6.1] - 2026-03-14
 ### Fixed
 - `#programme` import/save flow now waits properly between `save` -> name -> start-day steps, with 60-second defaults instead of auto-advancing through multiple prompts at once.

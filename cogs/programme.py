@@ -28,9 +28,20 @@ SWAP_RE = re.compile(
     re.IGNORECASE,
 )
 CHANGE_RE = re.compile(r"change\s+(.+?)\s+to\s+(.+)$", re.IGNORECASE)
+TYPE_CORRECTION_PATTERNS = [
+    re.compile(
+        r"^(?P<exercise>.+?)\s+(?:is|should be)\s+(?:a\s+|an\s+)?(?P<category>heavy[_ ]barbell|light[_ ]barbell|barbell|dumbbell|cable|machine|bodyweight|smith(?: machine)?)\b(?:.*)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:change|set|update)\s+(?P<exercise>.+?)\s+(?:to|as)\s+(?:a\s+|an\s+)?(?P<category>heavy[_ ]barbell|light[_ ]barbell|barbell|dumbbell|cable|machine|bodyweight|smith(?: machine)?)\b(?:.*)?$",
+        re.IGNORECASE,
+    ),
+]
 CONFIRM_TOKENS = {"save", "confirm", "import", "looks good", "ship it", "yes"}
 CANCEL_TOKENS = {"cancel", "stop", "never mind", "discard"}
 VALID_EQUIPMENT_TYPES = {"barbell", "dumbbell", "cable", "machine", "bodyweight", "smith machine", "unknown"}
+SHOW_PROGRAM_TOKENS = ("list", "show", "display", "current", "active", "what's", "whats")
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +203,42 @@ class ProgrammeCog(commands.Cog):
         heavy_tokens = ("squat", "bench", "deadlift", "overhead press", "ohp", "barbell row")
         return "heavy_barbell" if any(token in exercise_name.lower() for token in heavy_tokens) else "light_barbell"
 
+    def _category_label_from_db(self, category: str, equipment_type: str = "") -> str:
+        normalized_category = (category or "").strip().lower()
+        normalized_type = self._normalize_equipment_type(equipment_type)
+        if normalized_type == "smith machine" or normalized_category == "smith_machine":
+            return "smith"
+        if normalized_type == "machine":
+            return "machine"
+        if normalized_type == "cable":
+            return "cable"
+        if normalized_type == "dumbbell" or normalized_category == "dumbbell":
+            return "dumbbell"
+        if normalized_type == "bodyweight" or normalized_category == "bodyweight":
+            return "bodyweight"
+        if normalized_category in {"heavy_barbell", "light_barbell"}:
+            return normalized_category
+        return normalized_type or normalized_category or "unknown"
+
+    def _looks_like_show_program_intent(self, text: str) -> bool:
+        lowered = " ".join((text or "").strip().lower().split())
+        if "program" not in lowered:
+            return False
+        if any(token in lowered for token in ("what is my", "what's my", "whats my", "current program", "active program")):
+            return True
+        return any(token in lowered for token in SHOW_PROGRAM_TOKENS)
+
+    def _extract_type_correction(self, text: str) -> Optional[tuple[str, str]]:
+        for pattern in TYPE_CORRECTION_PATTERNS:
+            match = pattern.match((text or "").strip())
+            if not match:
+                continue
+            exercise_name = str(match.group("exercise") or "").strip(" .")
+            category = str(match.group("category") or "").strip(" .")
+            if exercise_name and category:
+                return exercise_name, category
+        return None
+
     def _normalize_program_payload(
         self,
         payload: dict[str, Any],
@@ -292,6 +339,39 @@ class ProgrammeCog(commands.Cog):
                     continue
                 unknowns.append({"day_name": day_name, "exercise_name": str(exercise.get("name") or "")})
         return unknowns
+
+    async def _render_active_program(self, user_id: str) -> Optional[str]:
+        program = await self.db.get_active_program(user_id)
+        if not program:
+            return None
+        days = await self.db.get_program_days(int(program["id"]))
+        if not days:
+            return f"📋 **{program['name']}** (Active Program) has no days."
+
+        lines = [f"📋 **{program['name']}** (Active Program — {len(days)} days)"]
+        for day in days:
+            lines.append("")
+            lines.append(f"**Day {int(day['day_order']) + 1} — {day['name']}**")
+            exercises = await self.db.get_exercises_for_day(int(day["id"]))
+            if not exercises:
+                lines.append("No exercises.")
+                continue
+            for idx, exercise in enumerate(exercises, start=1):
+                category_label = self._category_label_from_db(
+                    str(exercise.get("category") or ""),
+                    str(exercise.get("equipment_type") or ""),
+                )
+                lines.append(
+                    f"{idx}. {exercise['name']} — {self._format_rep_scheme(exercise)} (`{category_label}`)"
+                )
+        return "\n".join(lines)
+
+    async def _show_active_program(self, channel: discord.abc.Messageable, user_id: str) -> None:
+        rendered = await self._render_active_program(user_id)
+        if rendered is None:
+            await send_discord_text(channel, "No active program yet. Paste one in #programme.")
+            return
+        await send_discord_text(channel, rendered)
 
     async def _send_program_preview(
         self,
@@ -766,6 +846,31 @@ class ProgrammeCog(commands.Cog):
         )
         return True
 
+    async def _handle_type_correction_request(
+        self,
+        channel: discord.abc.Messageable,
+        text: str,
+        *,
+        user_id: str,
+    ) -> bool:
+        correction = self._extract_type_correction(text)
+        if correction is None:
+            return False
+        exercise_name, new_category = correction
+        updated = await self.db.update_exercise_category(
+            exercise_name=exercise_name,
+            new_category=new_category,
+            user_id=user_id,
+        )
+        if not updated:
+            await send_discord_text(channel, f"I couldn't find `{exercise_name}` in your active program.")
+            return True
+        await send_discord_text(
+            channel,
+            f"✅ Updated {updated['exercise_name']} from `{updated['old_category']}` -> `{updated['new_category']}`.",
+        )
+        return True
+
     async def _handle_simple_edit_request(
         self,
         channel: discord.abc.Messageable,
@@ -903,7 +1008,7 @@ class ProgrammeCog(commands.Cog):
     async def _reply_programme_message(self, channel: discord.abc.Messageable) -> None:
         await send_discord_text(
             channel,
-            "Paste a full program and I'll list it back exactly as written. If you want to edit the active program, say something like `swap Lat Pulldowns with Pull-Ups on Pull day`.",
+            "Paste a full program and I'll list it back exactly as written. You can also say `show my program`, `swap Lat Pulldowns with Pull-Ups on Pull day`, or `Leg Raises is bodyweight`.",
         )
 
     @commands.command(name="import")
@@ -919,20 +1024,7 @@ class ProgrammeCog(commands.Cog):
 
     @commands.command(name="program")
     async def show_program_command(self, ctx: commands.Context) -> None:
-        user_id = str(ctx.author.id)
-        program = await self.db.get_active_program(user_id)
-        if not program:
-            await send_discord_text(ctx.channel, "No active program yet. Paste one in #programme.")
-            return
-        days = await self.db.get_program_days(int(program["id"]))
-        if not days:
-            await send_discord_text(ctx.channel, f"Active program **{program['name']}** has no days.")
-            return
-        lines = [f"Active program: **{program['name']}** (ID {self._display_program_id(program)}, {len(days)} days)"]
-        for day in days:
-            exercises = await self.db.get_exercises_for_day(int(day["id"]))
-            lines.append(f"Day {day['day_order'] + 1}: {day['name']} ({len(exercises)} exercises)")
-        await send_discord_text(ctx.channel, "\n".join(lines))
+        await self._show_active_program(ctx.channel, str(ctx.author.id))
 
     @commands.command(name="startday")
     async def start_day_command(self, ctx: commands.Context, *, text: str) -> None:
@@ -1049,6 +1141,10 @@ class ProgrammeCog(commands.Cog):
                     await send_discord_text(message.channel, "Tell me the exact change you want and I'll apply only that.")
                 return
 
+            if self._looks_like_show_program_intent(content):
+                await self._show_active_program(message.channel, str(user_id))
+                return
+
             if self._looks_like_program_paste(content):
                 try:
                     await self._start_pending_program(message.channel, message.author, content)
@@ -1076,6 +1172,9 @@ class ProgrammeCog(commands.Cog):
                 if context:
                     self._clear_post_import_context(user_id, channel_id)
                     await send_discord_text(message.channel, "Program saved and ready. Head to your workout channel and type `ready` to start.")
+                return
+
+            if await self._handle_type_correction_request(message.channel, content, user_id=str(user_id)):
                 return
 
             if await self._handle_simple_edit_request(message.channel, content, user_id=str(user_id), requester_id=user_id):
