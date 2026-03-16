@@ -28,8 +28,10 @@ SWAP_RE = re.compile(
     re.IGNORECASE,
 )
 CHANGE_RE = re.compile(r"change\s+(.+?)\s+to\s+(.+)$", re.IGNORECASE)
-INDEX_REF_RE = re.compile(
-    r"(?:(?:switch|change|set|update)\s+)?(?P<day>\d+)\.(?P<ex>\d+)\s+(?:to|is|should be)\s+(?:a\s+|an\s+)?(?P<target>.+)$",
+INDEX_REF_DETECT_RE = re.compile(r"\b\d+\.\d+\b")
+INDEX_REF_PAIR_RE = re.compile(r"\b(?P<day>\d+)\.(?P<ex>\d+)\b")
+EQUIPMENT_KEYWORD_RE = re.compile(
+    r"\b(?:to|is|are|should be|=)\s+(?:a\s+|an\s+)?(?P<type>heavy[_ ]barbell|light[_ ]barbell|barbell|dumbbell|cable|machine|bodyweight|smith(?:\s+machine)?)\b",
     re.IGNORECASE,
 )
 TYPE_CORRECTION_PATTERNS = [
@@ -907,13 +909,53 @@ class ProgrammeCog(commands.Cog):
         *,
         user_id: str,
     ) -> bool:
-        match = INDEX_REF_RE.match(text.strip())
-        if not match:
+        """Handle batch index-based type corrections.
+
+        Supports formats like:
+          "1.1 1.2 are dumbbell, 1.4 is machine, 1.5, 1.6, 1.7 are cable"
+          "switch 1.1 to dumbbell"
+          "3.7 is bodyweight"
+        """
+        stripped = text.strip()
+        if not INDEX_REF_DETECT_RE.search(stripped):
             return False
 
-        day_num = int(match.group("day"))
-        ex_num = int(match.group("ex"))
-        target = str(match.group("target") or "").strip().rstrip(".")
+        # Split on commas to get segments, then accumulate index refs
+        # until we hit a type keyword.
+        segments = [s.strip() for s in stripped.split(",") if s.strip()]
+
+        batch: list[tuple[list[tuple[int, int]], str]] = []
+        pending_refs: list[tuple[int, int]] = []
+
+        for segment in segments:
+            refs = [(int(m.group("day")), int(m.group("ex"))) for m in INDEX_REF_PAIR_RE.finditer(segment)]
+            pending_refs.extend(refs)
+
+            type_match = EQUIPMENT_KEYWORD_RE.search(segment)
+            if type_match and pending_refs:
+                equip_type = type_match.group("type").strip().lower()
+                batch.append((list(pending_refs), equip_type))
+                pending_refs = []
+
+        # Handle leftover refs with a trailing type from the whole message
+        if pending_refs:
+            type_match = EQUIPMENT_KEYWORD_RE.search(stripped)
+            if type_match:
+                equip_type = type_match.group("type").strip().lower()
+                batch.append((list(pending_refs), equip_type))
+                pending_refs = []
+
+        if not batch and not pending_refs:
+            return False
+
+        if pending_refs:
+            ref_strs = [f"{d}.{e}" for d, e in pending_refs]
+            await send_discord_text(
+                channel,
+                f"I found references {', '.join(ref_strs)} but couldn't determine the type. "
+                f"Try: `{ref_strs[0]} is dumbbell` or `{', '.join(ref_strs)} are cable`.",
+            )
+            return True
 
         program = await self.db.get_active_program(user_id)
         if not program:
@@ -921,61 +963,53 @@ class ProgrammeCog(commands.Cog):
             return True
 
         days = await self.db.get_program_days(int(program["id"]))
-        if day_num < 1 or day_num > len(days):
-            await send_discord_text(channel, f"Day {day_num} doesn't exist. Program has {len(days)} days.")
-            return True
+        results: list[str] = []
+        errors: list[str] = []
+        day_exercises_cache: dict[int, list[dict[str, Any]]] = {}
 
-        day = days[day_num - 1]
-        exercises = await self.db.get_exercises_for_day(int(day["id"]))
-        if ex_num < 1 or ex_num > len(exercises):
-            await send_discord_text(
-                channel,
-                f"Exercise {ex_num} doesn't exist on {day['name']}. It has {len(exercises)} exercises.",
-            )
-            return True
+        for refs, equip_type in batch:
+            normalized_type = self._normalize_equipment_type(equip_type)
+            if normalized_type == "unknown":
+                ref_strs = [f"{d}.{e}" for d, e in refs]
+                errors.append(f"Unknown type `{equip_type}` for {', '.join(ref_strs)}.")
+                continue
 
-        exercise = exercises[ex_num - 1]
-        exercise_name = str(exercise["name"])
-        normalized_target = self._normalize_equipment_type(target)
-        if normalized_target != "unknown":
-            updated = await self.db.update_exercise_category(
-                exercise_name=exercise_name,
-                new_category=normalized_target,
-                user_id=user_id,
-            )
-            if updated:
-                await send_discord_text(
-                    channel,
-                    f"✅ Updated {updated['exercise_name']} (Day {day_num}.{ex_num}) from `{updated['old_category']}` -> `{updated['new_category']}`.",
+            for day_num, ex_num in refs:
+                if day_num < 1 or day_num > len(days):
+                    errors.append(f"Day {day_num} doesn't exist (program has {len(days)} days).")
+                    continue
+
+                day = days[day_num - 1]
+                day_id = int(day["id"])
+                if day_id not in day_exercises_cache:
+                    day_exercises_cache[day_id] = await self.db.get_exercises_for_day(day_id)
+                exercises = day_exercises_cache[day_id]
+
+                if ex_num < 1 or ex_num > len(exercises):
+                    errors.append(f"{day_num}.{ex_num} doesn't exist ({day['name']} has {len(exercises)} exercises).")
+                    continue
+
+                exercise = exercises[ex_num - 1]
+                exercise_name = str(exercise["name"])
+
+                updated = await self.db.update_exercise_category(
+                    exercise_name=exercise_name,
+                    new_category=normalized_type,
+                    user_id=user_id,
                 )
-            else:
-                await send_discord_text(channel, f"Failed to update {exercise_name}.")
-            return True
+                if updated:
+                    results.append(
+                        f"✅ {day_num}.{ex_num} {updated['exercise_name']}: "
+                        f"`{updated['old_category']}` → `{updated['new_category']}`"
+                    )
+                else:
+                    errors.append(f"Failed to update {exercise_name} ({day_num}.{ex_num}).")
 
-        new_equip = self._exercise_type_from_name_and_category(target, "")
-        if new_equip == "unknown":
-            self.pending_exercise_type_prompts[self._pending_key(int(user_id), getattr(channel, "id", 0))] = PendingExerciseTypePrompt(
-                user_id=int(user_id),
-                channel_id=getattr(channel, "id", 0),
-                old_name=exercise_name,
-                new_name=target,
-                day_hint=str(day["name"]),
-                created_at=self._now_utc(),
-            )
-            await send_discord_text(
-                channel,
-                f"Swapping **{exercise_name}** -> **{target}** on {day['name']}. What type is {target}? (`barbell`, `dumbbell`, `cable`, `machine`, `bodyweight`, `smith machine`)",
-            )
-            return True
+        if results:
+            await send_discord_text(channel, "\n".join(results))
+        if errors:
+            await send_discord_text(channel, "\n".join(errors))
 
-        await self._apply_active_swap(
-            channel,
-            user_id=user_id,
-            old_name=exercise_name,
-            new_name=target,
-            day_hint=str(day["name"]),
-            equipment_type=new_equip,
-        )
         return True
 
     async def _handle_type_correction_request(
