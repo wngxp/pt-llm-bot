@@ -59,7 +59,7 @@ class CoachCog(commands.Cog):
             system=COACH_SYSTEM_PROMPT,
             user=json.dumps(payload, ensure_ascii=False),
             temperature=0.25,
-            max_tokens=450,
+            max_tokens=900,
         )
 
     async def _handoff_program_import(self, message: discord.Message) -> None:

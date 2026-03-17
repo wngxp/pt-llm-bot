@@ -1,3 +1,7 @@
+## [0.6.4] - 2026-03-17
+### Fixed
+- Increased the `#coach` response cap so longer coaching replies are less likely to be cut off by the LLM token limit before Discord message splitting runs.
+
 ## [0.6.3] - 2026-03-17
 ### Fixed
 - `#programme` active-program messages now route through a structured LLM action layer instead of the old regex-only handlers, which fixes set/rep edits like `change 2.1 to 5x10`.
