@@ -13,7 +13,7 @@ import discord
 from discord.ext import commands
 
 from llm.parser import ProgramParser
-from llm.prompts import PROGRAMME_EDIT_JSON_SYSTEM_PROMPT, PROGRAMME_IMPORT_SYSTEM_PROMPT
+from llm.prompts import PROGRAMME_EDIT_JSON_SYSTEM_PROMPT, PROGRAMME_IMPORT_SYSTEM_PROMPT, PROGRAMME_ROUTER_SYSTEM_PROMPT
 from utils.discord_messages import send_discord_text, split_discord_message
 
 
@@ -76,6 +76,10 @@ class PendingExerciseTypePrompt:
     day_hint: Optional[str]
     created_at: datetime
     fallback_type: str = "unknown"
+    exercise_id: Optional[int] = None
+    new_sets: Optional[int] = None
+    new_rep_low: Optional[int] = None
+    new_rep_high: Optional[int] = None
 
 
 class ProgrammeCog(commands.Cog):
@@ -396,38 +400,442 @@ class ProgrammeCog(commands.Cog):
                 unknowns.append({"day_name": day_name, "exercise_name": str(exercise.get("name") or "")})
         return unknowns
 
-    async def _render_active_program(self, user_id: str) -> Optional[str]:
+    def _format_program_created_label(self, created_at: Any) -> Optional[str]:
+        raw = str(created_at or "").strip()
+        if not raw:
+            return None
+        candidates = [raw, raw.replace(" ", "T")]
+        for candidate in candidates:
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                return parsed.strftime("imported %b %d")
+            except ValueError:
+                continue
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                return parsed.strftime("imported %b %d")
+            except ValueError:
+                continue
+        return None
+
+    def _format_program_day_heading(self, day_number: int, day_name: str, exercise_count: int) -> str:
+        clean_name = day_name.strip()
+        if clean_name.lower().startswith("day "):
+            label = clean_name
+        else:
+            label = f"Day {day_number} - {clean_name}"
+        return f"{label} ({exercise_count} exercises)"
+
+    async def _build_active_program_context(self, user_id: str) -> Optional[dict[str, Any]]:
         program = await self.db.get_active_program(user_id)
         if not program:
             return None
         days = await self.db.get_program_days(int(program["id"]))
         if not days:
-            return f"📋 **{program['name']}** (Active Program) has no days."
+            return {
+                "program": program,
+                "days": [],
+                "exercise_map": {},
+                "current_day_index": 0,
+                "current_day": None,
+            }
 
-        lines = [f"📋 **{program['name']}** (Active Program — {len(days)} days)"]
-        for day in days:
-            lines.append("")
-            lines.append(f"**Day {int(day['day_order']) + 1} — {day['name']}**")
+        raw_current_day = await self.db.get_current_day_index(user_id)
+        current_day_index = raw_current_day % len(days)
+        day_entries: list[dict[str, Any]] = []
+        exercise_map: dict[str, dict[str, Any]] = {}
+
+        for day_number, day in enumerate(days, start=1):
             exercises = await self.db.get_exercises_for_day(int(day["id"]))
-            if not exercises:
-                lines.append("No exercises.")
-                continue
-            for idx, exercise in enumerate(exercises, start=1):
+            exercise_entries: list[dict[str, Any]] = []
+            for exercise_number, exercise in enumerate(exercises, start=1):
                 category_label = self._category_label_from_db(
                     str(exercise.get("category") or ""),
                     str(exercise.get("equipment_type") or ""),
                 )
-                lines.append(
-                    f"{idx}. {exercise['name']} — {self._format_rep_scheme(exercise)} (`{category_label}`)"
-                )
+                entry = {
+                    **exercise,
+                    "ref": f"{day_number}.{exercise_number}",
+                    "day_number": day_number,
+                    "exercise_number": exercise_number,
+                    "day_name": str(day["name"]),
+                    "category_label": category_label,
+                }
+                exercise_entries.append(entry)
+                exercise_map[entry["ref"]] = entry
+            day_entries.append(
+                {
+                    **day,
+                    "day_number": day_number,
+                    "heading": self._format_program_day_heading(day_number, str(day["name"]), len(exercise_entries)),
+                    "exercises": exercise_entries,
+                }
+            )
+
+        current_day = day_entries[current_day_index] if day_entries else None
+        return {
+            "program": program,
+            "days": day_entries,
+            "exercise_map": exercise_map,
+            "current_day_index": current_day_index,
+            "current_day": current_day,
+        }
+
+    def _format_active_program_header(self, context: dict[str, Any]) -> str:
+        program = context["program"]
+        imported_label = self._format_program_created_label(program.get("created_at"))
+        if imported_label:
+            title = f"📋 {program['name']} ({imported_label})"
+        else:
+            title = f"📋 {program['name']}"
+        current_day = context.get("current_day")
+        if current_day is None:
+            return f"{title}\nCurrent day: not set"
+        return f"{title}\nCurrent day: Day {current_day['day_number']} - {current_day['name']}"
+
+    def _format_active_program_day_block(self, day: dict[str, Any]) -> str:
+        lines = [day["heading"]]
+        if not day["exercises"]:
+            lines.append("  No exercises.")
+            return "\n".join(lines)
+        for exercise in day["exercises"]:
+            lines.append(
+                f"  {exercise['ref']} {exercise['name']} - {self._format_rep_scheme(exercise)} [{exercise['category_label']}]"
+            )
         return "\n".join(lines)
 
-    async def _show_active_program(self, channel: discord.abc.Messageable, user_id: str) -> None:
-        rendered = await self._render_active_program(user_id)
-        if rendered is None:
+    async def _send_active_program_summary(self, channel: discord.abc.Messageable, user_id: str) -> None:
+        context = await self._build_active_program_context(user_id)
+        if context is None:
             await send_discord_text(channel, "No active program yet. Paste one in #programme.")
             return
-        await send_discord_text(channel, rendered)
+        await send_discord_text(channel, self._format_active_program_header(context))
+        for day in context["days"]:
+            await send_discord_text(channel, self._format_active_program_day_block(day))
+
+    def _format_rep_scheme_from_values(
+        self,
+        *,
+        sets: int,
+        rep_low: Optional[int],
+        rep_high: Optional[int],
+    ) -> str:
+        exercise = {
+            "sets": sets,
+            "rep_range_low": rep_low,
+            "rep_range_high": rep_high,
+            "notes": "AMRAP" if rep_low is None and rep_high is None else "",
+        }
+        return self._format_rep_scheme(exercise)
+
+    async def _request_programme_action(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        user_id: str,
+        content: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        summary_lines = [self._format_active_program_header(context)]
+        for day in context["days"]:
+            summary_lines.append("")
+            summary_lines.append(self._format_active_program_day_block(day))
+        system_prompt = PROGRAMME_ROUTER_SYSTEM_PROMPT.replace("{program_summary}", "\n".join(summary_lines).strip())
+        payload = {
+            "message": content,
+            "current_day": context["current_day"]["day_number"] if context.get("current_day") else None,
+            "exercise_refs": {
+                ref: {
+                    "name": exercise["name"],
+                    "sets": exercise["sets"],
+                    "rep_low": exercise.get("rep_range_low"),
+                    "rep_high": exercise.get("rep_range_high"),
+                    "type": exercise["category_label"],
+                    "day": exercise["day_number"],
+                }
+                for ref, exercise in context["exercise_map"].items()
+            },
+        }
+        async with channel.typing():
+            response = await self.bot.ollama.chat_json(
+                system=system_prompt,
+                user=json.dumps(payload, ensure_ascii=False),
+                temperature=0.0,
+                max_tokens=1200,
+            )
+        if not isinstance(response, dict):
+            raise ValueError("Programme router returned a non-object response")
+        return response
+
+    async def _execute_update_sets_reps(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        user_id: str,
+        context: dict[str, Any],
+        action: dict[str, Any],
+    ) -> None:
+        exercise_ref = str(action.get("exercise_ref") or "").strip()
+        target = context["exercise_map"].get(exercise_ref)
+        if not target:
+            await send_discord_text(channel, f"I couldn't find exercise reference `{exercise_ref}`.")
+            return
+        sets = max(1, int(action.get("sets") or target["sets"]))
+        rep_low = self._int_or_none(action.get("rep_low"))
+        rep_high = self._int_or_none(action.get("rep_high"))
+        if rep_low is None and rep_high is None:
+            await send_discord_text(channel, "Tell me the new reps in a format like `5x10` or `4x8-10`.")
+            return
+        if rep_low is None:
+            rep_low = rep_high
+        if rep_high is None:
+            rep_high = rep_low
+        updated = await self.db.update_exercise_scheme_by_id(
+            int(target["id"]),
+            user_id=user_id,
+            sets=sets,
+            rep_low=rep_low,
+            rep_high=rep_high,
+        )
+        if not updated:
+            await send_discord_text(channel, f"I couldn't update `{exercise_ref}`.")
+            return
+        old_scheme = self._format_rep_scheme_from_values(
+            sets=int(updated["old_sets"]),
+            rep_low=updated["old_rep_low"],
+            rep_high=updated["old_rep_high"],
+        )
+        new_scheme = self._format_rep_scheme_from_values(
+            sets=int(updated["new_sets"]),
+            rep_low=updated["new_rep_low"],
+            rep_high=updated["new_rep_high"],
+        )
+        await send_discord_text(channel, f"✅ {exercise_ref} {updated['exercise_name']}: {old_scheme} -> {new_scheme}")
+
+    async def _execute_update_types(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        user_id: str,
+        context: dict[str, Any],
+        action: dict[str, Any],
+    ) -> None:
+        exercises = action.get("exercises")
+        if not isinstance(exercises, dict) or not exercises:
+            await send_discord_text(channel, "Tell me which exercise references you want to update, for example `2.1 is cable`.")
+            return
+        lines: list[str] = []
+        errors: list[str] = []
+        for exercise_ref, requested_type in exercises.items():
+            target = context["exercise_map"].get(str(exercise_ref))
+            if not target:
+                errors.append(f"I couldn't find `{exercise_ref}`.")
+                continue
+            requested_label = str(requested_type or "").strip()
+            normalized_type = self._normalize_equipment_type(requested_label)
+            if normalized_type == "unknown" and requested_label.lower() not in {"heavy_barbell", "light_barbell"}:
+                errors.append(f"I couldn't map `{requested_label}` for {exercise_ref}.")
+                continue
+            updated = await self.db.update_exercise_category_by_id(
+                int(target["id"]),
+                requested_label if requested_label else normalized_type,
+                user_id=user_id,
+            )
+            if not updated:
+                errors.append(f"I couldn't update `{exercise_ref}`.")
+                continue
+            lines.append(
+                f"✅ {exercise_ref} {updated['exercise_name']}: {updated['old_category']} -> {updated['new_category']}"
+            )
+        if lines:
+            await send_discord_text(channel, "\n".join(lines))
+        if errors:
+            await send_discord_text(channel, "\n".join(errors))
+
+    async def _execute_swap_exercise(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        user_id: str,
+        context: dict[str, Any],
+        action: dict[str, Any],
+    ) -> None:
+        exercise_ref = str(action.get("exercise_ref") or "").strip()
+        target = context["exercise_map"].get(exercise_ref)
+        if not target:
+            await send_discord_text(channel, f"I couldn't find exercise reference `{exercise_ref}`.")
+            return
+
+        new_name = str(action.get("new_name") or "").strip()
+        if not new_name:
+            await send_discord_text(channel, "Tell me the replacement exercise name.")
+            return
+
+        requested_type = str(action.get("new_type") or "").strip()
+        equipment_type = self._normalize_equipment_type(requested_type)
+        if equipment_type == "unknown":
+            equipment_type = self._normalize_equipment_type(
+                self._exercise_type_from_name_and_category(new_name, "")
+            )
+        if equipment_type == "unknown":
+            self.pending_exercise_type_prompts[self._pending_key(int(user_id), getattr(channel, "id", 0))] = PendingExerciseTypePrompt(
+                user_id=int(user_id),
+                channel_id=getattr(channel, "id", 0),
+                old_name=str(target["name"]),
+                new_name=new_name,
+                day_hint=str(target["day_name"]),
+                created_at=self._now_utc(),
+                exercise_id=int(target["id"]),
+                new_sets=self._int_or_none(action.get("new_sets")),
+                new_rep_low=self._int_or_none(action.get("new_rep_low")),
+                new_rep_high=self._int_or_none(action.get("new_rep_high")),
+            )
+            await send_discord_text(
+                channel,
+                f"What type is {new_name}? Reply with `barbell`, `dumbbell`, `cable`, `machine`, `bodyweight`, or `smith machine`.",
+            )
+            return
+
+        updated = await self.db.replace_exercise_in_active_program_by_id(
+            int(target["id"]),
+            user_id=user_id,
+            new_name=new_name,
+            new_category=self._db_category_from_equipment_type(new_name, equipment_type, fallback=str(target.get("category") or "")),
+            new_equipment_type=equipment_type,
+            new_sets=self._int_or_none(action.get("new_sets")),
+            new_rep_low=self._int_or_none(action.get("new_rep_low")),
+            new_rep_high=self._int_or_none(action.get("new_rep_high")),
+        )
+        if not updated:
+            await send_discord_text(channel, f"I couldn't replace `{exercise_ref}`.")
+            return
+        scheme = self._format_rep_scheme_from_values(
+            sets=int(updated["new_sets"]),
+            rep_low=updated["new_rep_low"],
+            rep_high=updated["new_rep_high"],
+        )
+        type_label = self._category_label_from_db(str(updated["category"]), str(updated["equipment_type"]))
+        await send_discord_text(
+            channel,
+            f"✅ {exercise_ref} {updated['old_name']} -> {updated['new_name']} ({scheme}) [{type_label}]",
+        )
+
+    async def _execute_remove_exercise(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        user_id: str,
+        context: dict[str, Any],
+        action: dict[str, Any],
+    ) -> None:
+        exercise_ref = str(action.get("exercise_ref") or "").strip()
+        target = context["exercise_map"].get(exercise_ref)
+        if not target:
+            await send_discord_text(channel, f"I couldn't find exercise reference `{exercise_ref}`.")
+            return
+        removed = await self.db.remove_exercise_from_active_program_by_id(int(target["id"]), user_id=user_id)
+        if not removed:
+            await send_discord_text(channel, f"I couldn't remove `{exercise_ref}`.")
+            return
+        await send_discord_text(channel, f"✅ Removed {exercise_ref} {removed['exercise_name']} from {removed['day_name']}.")
+
+    async def _execute_add_exercise(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        user_id: str,
+        context: dict[str, Any],
+        action: dict[str, Any],
+    ) -> None:
+        day_number = int(action.get("day") or 0)
+        if day_number < 1 or day_number > len(context["days"]):
+            await send_discord_text(channel, f"Day {day_number} doesn't exist.")
+            return
+        day = context["days"][day_number - 1]
+        name = str(action.get("name") or "").strip()
+        if not name:
+            await send_discord_text(channel, "Tell me the exercise name to add.")
+            return
+        sets = max(1, int(action.get("sets") or 1))
+        rep_low = self._int_or_none(action.get("rep_low"))
+        rep_high = self._int_or_none(action.get("rep_high"))
+        if rep_low is None and rep_high is None:
+            await send_discord_text(channel, "Tell me the set and rep scheme too, for example `3x15`.")
+            return
+        if rep_low is None:
+            rep_low = rep_high
+        if rep_high is None:
+            rep_high = rep_low
+        requested_type = str(action.get("type") or "").strip()
+        equipment_type = self._normalize_equipment_type(requested_type)
+        if equipment_type == "unknown":
+            equipment_type = self._normalize_equipment_type(self._exercise_type_from_name_and_category(name, ""))
+        if equipment_type == "unknown":
+            await send_discord_text(
+                channel,
+                f"I couldn't infer the type for {name}. Tell me if it's `barbell`, `dumbbell`, `cable`, `machine`, `bodyweight`, or `smith machine`.",
+            )
+            return
+        added = await self.db.add_exercise_to_program_day(
+            int(day["id"]),
+            user_id=user_id,
+            name=name,
+            sets=sets,
+            rep_low=rep_low,
+            rep_high=rep_high,
+            category=self._db_category_from_equipment_type(name, equipment_type),
+            equipment_type=equipment_type,
+        )
+        if not added:
+            await send_discord_text(channel, f"I couldn't add {name} to Day {day_number}.")
+            return
+        exercise_ref = f"{day_number}.{len(day['exercises']) + 1}"
+        scheme = self._format_rep_scheme_from_values(sets=sets, rep_low=rep_low, rep_high=rep_high)
+        await send_discord_text(channel, f"✅ Added {exercise_ref} {name} ({scheme}) [{equipment_type}] to {day['name']}.")
+
+    async def _handle_active_programme_message_with_llm(
+        self,
+        channel: discord.abc.Messageable,
+        content: str,
+        *,
+        user_id: str,
+    ) -> bool:
+        context = await self._build_active_program_context(user_id)
+        if context is None:
+            return False
+        try:
+            action = await self._request_programme_action(channel, user_id=user_id, content=content, context=context)
+        except Exception as exc:
+            await send_discord_text(channel, f"I couldn't interpret that program request cleanly yet: {exc}")
+            return True
+
+        action_name = str(action.get("action") or "conversation").strip().lower()
+        if action_name == "show_program":
+            await self._send_active_program_summary(channel, user_id)
+            return True
+        if action_name == "update_sets_reps":
+            await self._execute_update_sets_reps(channel, user_id=user_id, context=context, action=action)
+            return True
+        if action_name == "update_type":
+            await self._execute_update_types(channel, user_id=user_id, context=context, action=action)
+            return True
+        if action_name == "swap_exercise":
+            await self._execute_swap_exercise(channel, user_id=user_id, context=context, action=action)
+            return True
+        if action_name == "remove_exercise":
+            await self._execute_remove_exercise(channel, user_id=user_id, context=context, action=action)
+            return True
+        if action_name == "add_exercise":
+            await self._execute_add_exercise(channel, user_id=user_id, context=context, action=action)
+            return True
+
+        response = str(action.get("response") or "").strip()
+        if response:
+            await send_discord_text(channel, response)
+        else:
+            await send_discord_text(channel, "Tell me what you want to change in the program and I'll handle it.")
+        return True
 
     async def _send_program_preview(
         self,
@@ -892,6 +1300,31 @@ class ProgrammeCog(commands.Cog):
             )
             return True
         self._clear_pending_exercise_type_prompt(author.id, getattr(channel, "id", 0))
+        if prompt.exercise_id is not None:
+            updated = await self.db.replace_exercise_in_active_program_by_id(
+                int(prompt.exercise_id),
+                user_id=str(author.id),
+                new_name=prompt.new_name,
+                new_category=self._db_category_from_equipment_type(prompt.new_name, equipment_type),
+                new_equipment_type=equipment_type,
+                new_sets=prompt.new_sets,
+                new_rep_low=prompt.new_rep_low,
+                new_rep_high=prompt.new_rep_high,
+            )
+            if not updated:
+                await send_discord_text(channel, f"Couldn't replace `{prompt.old_name}` in the active program.")
+                return True
+            scheme = self._format_rep_scheme_from_values(
+                sets=int(updated["new_sets"]),
+                rep_low=updated["new_rep_low"],
+                rep_high=updated["new_rep_high"],
+            )
+            type_label = self._category_label_from_db(str(updated["category"]), str(updated["equipment_type"]))
+            await send_discord_text(
+                channel,
+                f"✅ {updated['old_name']} -> {updated['new_name']} ({scheme}) [{type_label}] on {updated['day_name']}.",
+            )
+            return True
         await self._apply_active_swap(
             channel,
             user_id=str(author.id),
@@ -1174,7 +1607,7 @@ class ProgrammeCog(commands.Cog):
     async def _reply_programme_message(self, channel: discord.abc.Messageable) -> None:
         await send_discord_text(
             channel,
-            "Paste a full program and I'll list it back exactly as written. You can also say `show my program`, `swap Lat Pulldowns with Pull-Ups on Pull day`, or `Leg Raises is bodyweight`.",
+            "Paste a full program and I'll list it back exactly as written. You can also say `show`, `change 2.1 to 5x10`, `swap 2.1 with pull-ups`, or `2.1, 2.2 are cable. 2.6 is dumbbell`.",
         )
 
     @commands.command(name="import")
@@ -1190,7 +1623,7 @@ class ProgrammeCog(commands.Cog):
 
     @commands.command(name="program")
     async def show_program_command(self, ctx: commands.Context) -> None:
-        await self._show_active_program(ctx.channel, str(ctx.author.id))
+        await self._send_active_program_summary(ctx.channel, str(ctx.author.id))
 
     @commands.command(name="startday")
     async def start_day_command(self, ctx: commands.Context, *, text: str) -> None:
@@ -1307,10 +1740,6 @@ class ProgrammeCog(commands.Cog):
                     await send_discord_text(message.channel, "Tell me the exact change you want and I'll apply only that.")
                 return
 
-            if self._looks_like_show_program_intent(content):
-                await self._show_active_program(message.channel, str(user_id))
-                return
-
             if self._looks_like_program_paste(content):
                 try:
                     await self._start_pending_program(message.channel, message.author, content)
@@ -1340,13 +1769,7 @@ class ProgrammeCog(commands.Cog):
                     await send_discord_text(message.channel, "Program saved and ready. Head to your workout channel and type `ready` to start.")
                 return
 
-            if await self._handle_index_based_correction(message.channel, content, user_id=str(user_id)):
-                return
-
-            if await self._handle_type_correction_request(message.channel, content, user_id=str(user_id)):
-                return
-
-            if await self._handle_simple_edit_request(message.channel, content, user_id=str(user_id), requester_id=user_id):
+            if await self._handle_active_programme_message_with_llm(message.channel, content, user_id=str(user_id)):
                 return
 
             await self._reply_programme_message(message.channel)

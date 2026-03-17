@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Iterable, Optional
 import aiosqlite
 
 DEFAULT_USER_ID = "legacy"
+ARCHIVE_DAY_NAME = "__ARCHIVE__"
 
 
 class Database:
@@ -278,6 +279,55 @@ class Database:
             await conn.execute("ALTER TABLE workout_logs ADD COLUMN performed_category TEXT")
         if "performed_equipment_type" not in columns:
             await conn.execute("ALTER TABLE workout_logs ADD COLUMN performed_equipment_type TEXT")
+
+    async def _snapshot_exercise_logs(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        exercise_id: int,
+        user_id: str,
+        exercise_name: str,
+        category: str,
+        equipment_type: str,
+    ) -> None:
+        await conn.execute(
+            """
+            UPDATE workout_logs
+            SET performed_exercise_name = COALESCE(performed_exercise_name, ?),
+                performed_category = COALESCE(performed_category, ?),
+                performed_equipment_type = COALESCE(performed_equipment_type, ?)
+            WHERE exercise_id = ?
+              AND user_id = ?
+            """,
+            (exercise_name, category, equipment_type, exercise_id, user_id),
+        )
+
+    async def _get_or_create_archive_day(self, conn: aiosqlite.Connection, *, program_id: int) -> int:
+        row = await self._fetchone(
+            conn,
+            """
+            SELECT id
+            FROM program_days
+            WHERE program_id = ?
+              AND name = ?
+            LIMIT 1
+            """,
+            (program_id, ARCHIVE_DAY_NAME),
+        )
+        if row:
+            return int(row["id"])
+
+        max_order_row = await self._fetchone(
+            conn,
+            "SELECT COALESCE(MAX(day_order), -1) AS max_day_order FROM program_days WHERE program_id = ?",
+            (program_id,),
+        )
+        next_order = int(max_order_row["max_day_order"] or -1) + 1 if max_order_row else 0
+        cursor = await conn.execute(
+            "INSERT INTO program_days (program_id, day_order, name) VALUES (?, ?, ?)",
+            (program_id, next_order, ARCHIVE_DAY_NAME),
+        )
+        return int(cursor.lastrowid)
 
     def _category_label_from_storage(self, category: str, equipment_type: str) -> str:
         normalized_category = str(category or "").strip().lower()
@@ -710,8 +760,8 @@ class Database:
     async def get_program_days(self, program_id: int) -> list[dict[str, Any]]:
         async with self.connect() as conn:
             rows = await self._fetchall(conn, 
-                "SELECT * FROM program_days WHERE program_id = ? ORDER BY day_order",
-                (program_id,),
+                "SELECT * FROM program_days WHERE program_id = ? AND name != ? ORDER BY day_order",
+                (program_id, ARCHIVE_DAY_NAME),
             )
         return [dict(r) for r in rows]
 
@@ -1546,6 +1596,124 @@ class Database:
             )
         return dict(row) if row else None
 
+    async def get_exercise_by_reference(
+        self,
+        day_number: int,
+        exercise_number: int,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        days = await self.get_program_days(int(program["id"]))
+        if day_number < 1 or day_number > len(days):
+            return None
+        day = days[day_number - 1]
+        exercises = await self.get_exercises_for_day(int(day["id"]))
+        if exercise_number < 1 or exercise_number > len(exercises):
+            return None
+        exercise = dict(exercises[exercise_number - 1])
+        exercise["day_name"] = str(day["name"])
+        exercise["day_number"] = day_number
+        exercise["exercise_number"] = exercise_number
+        exercise["program_id"] = int(program["id"])
+        return exercise
+
+    async def update_exercise_scheme_by_id(
+        self,
+        exercise_id: int,
+        *,
+        user_id: Optional[str | int] = None,
+        sets: int,
+        rep_low: Optional[int],
+        rep_high: Optional[int],
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT e.id, e.name, e.sets, e.rep_range_low, e.rep_range_high, d.name AS day_name
+                FROM exercises e
+                JOIN program_days d ON d.id = e.program_day_id
+                WHERE e.id = ?
+                  AND d.program_id = ?
+                LIMIT 1
+                """,
+                (exercise_id, int(program["id"])),
+            )
+            if not row:
+                return None
+            await conn.execute(
+                """
+                UPDATE exercises
+                SET sets = ?, rep_range_low = ?, rep_range_high = ?
+                WHERE id = ?
+                """,
+                (max(1, int(sets)), rep_low, rep_high, exercise_id),
+            )
+            await conn.commit()
+        return {
+            "exercise_id": int(row["id"]),
+            "exercise_name": str(row["name"]),
+            "day_name": str(row["day_name"]),
+            "old_sets": int(row["sets"] or 1),
+            "old_rep_low": None if row["rep_range_low"] is None else int(row["rep_range_low"]),
+            "old_rep_high": None if row["rep_range_high"] is None else int(row["rep_range_high"]),
+            "new_sets": max(1, int(sets)),
+            "new_rep_low": rep_low,
+            "new_rep_high": rep_high,
+        }
+
+    async def update_exercise_category_by_id(
+        self,
+        exercise_id: int,
+        new_category: str,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT e.id, e.name, e.category, e.equipment_type, d.name AS day_name
+                FROM exercises e
+                JOIN program_days d ON d.id = e.program_day_id
+                WHERE e.id = ?
+                  AND d.program_id = ?
+                LIMIT 1
+                """,
+                (exercise_id, int(program["id"])),
+            )
+            if not row:
+                return None
+
+            old_category = self._category_label_from_storage(str(row["category"] or ""), str(row["equipment_type"] or ""))
+            db_category, equipment_type = self._storage_category_and_equipment(
+                str(row["name"]),
+                new_category,
+                current_category=str(row["category"] or ""),
+            )
+            await conn.execute(
+                "UPDATE exercises SET category = ?, equipment_type = ? WHERE id = ?",
+                (db_category, equipment_type, exercise_id),
+            )
+            await conn.commit()
+        return {
+            "exercise_id": int(row["id"]),
+            "exercise_name": str(row["name"]),
+            "day_name": str(row["day_name"]),
+            "old_category": old_category,
+            "new_category": self._category_label_from_storage(db_category, equipment_type),
+            "updated_rows": 1,
+        }
+
     async def update_exercise_category(
         self,
         exercise_name: str,
@@ -1624,7 +1792,29 @@ class Database:
         program = await self.get_active_program(user_id)
         if not program:
             return 0
+        normalized = self._normalize_user_id(user_id)
         async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT e.id AS exercise_id, e.name AS exercise_name, e.category AS category, e.equipment_type AS equipment_type
+                FROM exercises e
+                JOIN program_days d ON d.id = e.program_day_id
+                WHERE d.program_id = ? AND LOWER(e.name) = LOWER(?)
+                ORDER BY d.day_order, e.display_order
+                LIMIT 1
+                """,
+                (int(program["id"]), old_name),
+            )
+            if row:
+                await self._snapshot_exercise_logs(
+                    conn,
+                    exercise_id=int(row["exercise_id"]),
+                    user_id=normalized,
+                    exercise_name=str(row["exercise_name"]),
+                    category=str(row["category"] or ""),
+                    equipment_type=str(row["equipment_type"] or ""),
+                )
             cursor = await conn.execute(
                 """
                 UPDATE exercises
@@ -1682,6 +1872,14 @@ class Database:
                 return None
 
             ex_id = int(row["exercise_id"])
+            await self._snapshot_exercise_logs(
+                conn,
+                exercise_id=ex_id,
+                user_id=self._normalize_user_id(user_id),
+                exercise_name=str(row["exercise_name"]),
+                category=str(row["category"] or ""),
+                equipment_type=str(row["equipment_type"] or ""),
+            )
             next_category = str(new_category or row["category"] or "cable_machine")
             next_equipment_type = str(
                 new_equipment_type or row["equipment_type"] or self._infer_equipment_type(new_name, next_category)
@@ -1699,6 +1897,203 @@ class Database:
                 "category": next_category,
                 "equipment_type": next_equipment_type,
             }
+
+    async def replace_exercise_in_active_program_by_id(
+        self,
+        exercise_id: int,
+        *,
+        user_id: Optional[str | int] = None,
+        new_name: str,
+        new_category: str,
+        new_equipment_type: str,
+        new_sets: Optional[int] = None,
+        new_rep_low: Optional[int] = None,
+        new_rep_high: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        normalized = self._normalize_user_id(user_id)
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT e.id AS exercise_id,
+                       e.name AS exercise_name,
+                       e.category AS category,
+                       e.equipment_type AS equipment_type,
+                       e.sets AS sets,
+                       e.rep_range_low AS rep_range_low,
+                       e.rep_range_high AS rep_range_high,
+                       d.name AS day_name
+                FROM exercises e
+                JOIN program_days d ON d.id = e.program_day_id
+                WHERE e.id = ?
+                  AND d.program_id = ?
+                LIMIT 1
+                """,
+                (exercise_id, int(program["id"])),
+            )
+            if not row:
+                return None
+
+            await self._snapshot_exercise_logs(
+                conn,
+                exercise_id=int(row["exercise_id"]),
+                user_id=normalized,
+                exercise_name=str(row["exercise_name"]),
+                category=str(row["category"] or ""),
+                equipment_type=str(row["equipment_type"] or ""),
+            )
+            sets = int(new_sets) if new_sets is not None else int(row["sets"] or 1)
+            rep_low = new_rep_low if new_rep_low is not None else row["rep_range_low"]
+            rep_high = new_rep_high if new_rep_high is not None else row["rep_range_high"]
+            await conn.execute(
+                """
+                UPDATE exercises
+                SET name = ?, category = ?, equipment_type = ?, sets = ?, rep_range_low = ?, rep_range_high = ?
+                WHERE id = ?
+                """,
+                (new_name, new_category, new_equipment_type, sets, rep_low, rep_high, exercise_id),
+            )
+            await conn.commit()
+        return {
+            "exercise_id": int(row["exercise_id"]),
+            "old_name": str(row["exercise_name"]),
+            "new_name": new_name,
+            "day_name": str(row["day_name"]),
+            "old_sets": int(row["sets"] or 1),
+            "old_rep_low": None if row["rep_range_low"] is None else int(row["rep_range_low"]),
+            "old_rep_high": None if row["rep_range_high"] is None else int(row["rep_range_high"]),
+            "new_sets": sets,
+            "new_rep_low": None if rep_low is None else int(rep_low),
+            "new_rep_high": None if rep_high is None else int(rep_high),
+            "category": new_category,
+            "equipment_type": new_equipment_type,
+        }
+
+    async def remove_exercise_from_active_program_by_id(
+        self,
+        exercise_id: int,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT e.id AS exercise_id,
+                       e.name AS exercise_name,
+                       e.display_order AS display_order,
+                       e.program_day_id AS program_day_id,
+                       d.name AS day_name
+                FROM exercises e
+                JOIN program_days d ON d.id = e.program_day_id
+                WHERE e.id = ?
+                  AND d.program_id = ?
+                LIMIT 1
+                """,
+                (exercise_id, int(program["id"])),
+            )
+            if not row:
+                return None
+
+            source_day_id = int(row["program_day_id"])
+            archive_day_id = await self._get_or_create_archive_day(conn, program_id=int(program["id"]))
+            archive_order_row = await self._fetchone(
+                conn,
+                "SELECT COALESCE(MAX(display_order), -1) AS max_display_order FROM exercises WHERE program_day_id = ?",
+                (archive_day_id,),
+            )
+            archive_order = int(archive_order_row["max_display_order"] or -1) + 1 if archive_order_row else 0
+            await conn.execute(
+                "UPDATE exercises SET program_day_id = ?, display_order = ? WHERE id = ?",
+                (archive_day_id, archive_order, exercise_id),
+            )
+
+            remaining = await self._fetchall(
+                conn,
+                """
+                SELECT id
+                FROM exercises
+                WHERE program_day_id = ?
+                ORDER BY display_order, id
+                """,
+                (source_day_id,),
+            )
+            for idx, exercise_row in enumerate(remaining):
+                await conn.execute(
+                    "UPDATE exercises SET display_order = ? WHERE id = ?",
+                    (idx, int(exercise_row["id"])),
+                )
+            await conn.commit()
+        return {
+            "exercise_id": int(row["exercise_id"]),
+            "exercise_name": str(row["exercise_name"]),
+            "day_name": str(row["day_name"]),
+        }
+
+    async def add_exercise_to_program_day(
+        self,
+        day_id: int,
+        *,
+        user_id: Optional[str | int] = None,
+        name: str,
+        sets: int,
+        rep_low: Optional[int],
+        rep_high: Optional[int],
+        category: str,
+        equipment_type: str,
+        notes: str = "",
+        muscle_groups: str = "",
+    ) -> Optional[dict[str, Any]]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        async with self.connect() as conn:
+            day = await self._fetchone(
+                conn,
+                """
+                SELECT id, name
+                FROM program_days
+                WHERE id = ?
+                  AND program_id = ?
+                LIMIT 1
+                """,
+                (day_id, int(program["id"])),
+            )
+            if not day or str(day["name"]) == ARCHIVE_DAY_NAME:
+                return None
+            order_row = await self._fetchone(
+                conn,
+                "SELECT COALESCE(MAX(display_order), -1) AS max_display_order FROM exercises WHERE program_day_id = ?",
+                (day_id,),
+            )
+            next_order = int(order_row["max_display_order"] or -1) + 1 if order_row else 0
+            cursor = await conn.execute(
+                """
+                INSERT INTO exercises (
+                    program_day_id, name, display_order, sets, rep_range_low, rep_range_high,
+                    category, equipment_type, superset_group, notes, muscle_groups
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (day_id, name, next_order, max(1, int(sets)), rep_low, rep_high, category, equipment_type, notes, muscle_groups),
+            )
+            await conn.commit()
+        return {
+            "exercise_id": int(cursor.lastrowid),
+            "exercise_name": name,
+            "day_name": str(day["name"]),
+            "display_order": next_order,
+            "sets": max(1, int(sets)),
+            "rep_range_low": rep_low,
+            "rep_range_high": rep_high,
+            "category": category,
+            "equipment_type": equipment_type,
+        }
 
     async def rename_program_day_in_active_program(
         self,

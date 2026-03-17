@@ -1,3 +1,13 @@
+## [0.6.3] - 2026-03-17
+### Fixed
+- `#programme` active-program messages now route through a structured LLM action layer instead of the old regex-only handlers, which fixes set/rep edits like `change 2.1 to 5x10`.
+- Mixed type-correction messages such as `2.1, 2.2 are cable. 2.6 is dumbbell` now preserve per-reference assignments instead of leaking the first type across every exercise.
+- `!program` and natural-language `show` requests in `#programme` now render the current program with day/exercise indices, current-day context, and visible equipment labels.
+
+### Added
+- `#programme` now supports structured active-program actions for set/rep updates, swaps, removals, additions, and conversation replies through the LLM router.
+- Post-import swaps now snapshot existing exercise logs before renaming rows, so old workout history stays tied to the previous exercise name while the replacement starts fresh.
+
 ## [0.6.2] - 2026-03-16
 ### Fixed
 - Discord long-form replies now split on paragraph and sentence boundaries with a 1900-character safety buffer, preventing silent truncation in `#coach`, `#check-in`, `#programme`, and other LLM-driven channels.
