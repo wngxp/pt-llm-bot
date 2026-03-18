@@ -15,6 +15,7 @@ from discord.ext import commands
 from llm.parser import ProgramParser
 from llm.prompts import PROGRAMME_EDIT_JSON_SYSTEM_PROMPT, PROGRAMME_IMPORT_SYSTEM_PROMPT, PROGRAMME_ROUTER_SYSTEM_PROMPT
 from utils.discord_messages import send_discord_text, split_discord_message
+from utils.logbook_import import LogbookImportError, parse_structured_logbook_bytes
 
 
 DURATION_RE = re.compile(r"(?P<num>\d+)\s*(?P<unit>day|days|week|weeks)", re.IGNORECASE)
@@ -419,13 +420,91 @@ class ProgrammeCog(commands.Cog):
                 continue
         return None
 
-    def _format_program_day_heading(self, day_number: int, day_name: str, exercise_count: int) -> str:
+    def _format_program_day_heading(
+        self,
+        day_number: int,
+        day_name: str,
+        exercise_count: int,
+        *,
+        block: Optional[str] = None,
+        week: Optional[int] = None,
+        programmed_day_number: Optional[int] = None,
+    ) -> str:
         clean_name = day_name.strip()
-        if clean_name.lower().startswith("day "):
+        if block and week is not None and programmed_day_number is not None:
+            label = f"{block} Week {week} Day {programmed_day_number} - {clean_name}"
+        elif clean_name.lower().startswith("day "):
             label = clean_name
         else:
             label = f"Day {day_number} - {clean_name}"
         return f"{label} ({exercise_count} exercises)"
+
+    def _attachment_looks_like_logbook(self, attachment: object) -> bool:
+        filename = str(getattr(attachment, "filename", "") or "").lower()
+        return filename.endswith((".xlsx", ".xlsm", ".xls", ".csv"))
+
+    async def _import_structured_logbook_attachment(
+        self,
+        channel: discord.abc.Messageable,
+        author: discord.abc.User,
+        attachment: object,
+    ) -> bool:
+        filename = str(getattr(attachment, "filename", "") or "logbook.xlsx")
+        reader = getattr(attachment, "read", None)
+        if reader is None:
+            await send_discord_text(channel, f"I couldn't read `{filename}`.")
+            return True
+
+        try:
+            async with channel.typing():
+                data = await reader()
+                payload = parse_structured_logbook_bytes(data, filename)
+        except LogbookImportError as exc:
+            await send_discord_text(channel, f"I couldn't import `{filename}`: {exc}")
+            return True
+        except Exception as exc:
+            await send_discord_text(channel, f"I couldn't parse `{filename}` cleanly yet: {exc}")
+            return True
+
+        user_id = str(author.id)
+        async with channel.typing():
+            recent = await self.db.get_recent_program_by_name(str(payload["program_name"]), user_id=user_id, minutes=5)
+            if recent:
+                display_id = int(recent.get("display_id") or recent.get("id") or 0)
+                await send_discord_text(
+                    channel,
+                    f"Skipped duplicate import: **{payload['program_name']}** was already imported recently (ID {display_id}).",
+                )
+                return True
+
+            program_id = await self.db.create_program_from_payload(payload, user_id=user_id)
+            created_program = await self.db.get_program_by_id(program_id)
+
+        summary = payload.get("import_summary") if isinstance(payload, dict) else {}
+        if isinstance(summary, dict):
+            first_active_idx = int(summary.get("first_active_day_index") or 0)
+            await self.db.set_current_day_index(first_active_idx, user_id=user_id)
+            label = str(summary.get("label") or payload["program_name"])
+            total_days = int(summary.get("days") or len(payload.get("days", [])))
+            total_exercises = int(
+                summary.get("exercises") or sum(len(day.get("exercises", [])) for day in payload.get("days", []))
+            )
+            total_weeks = int(summary.get("weeks") or 0)
+        else:
+            label = str(payload["program_name"])
+            total_days = len(payload.get("days", []))
+            total_exercises = sum(len(day.get("exercises", [])) for day in payload.get("days", []))
+            total_weeks = 0
+
+        if created_program:
+            display_id = int(created_program.get("display_id") or program_id)
+            logger.info("Imported structured logbook %s as program %s", label, display_id)
+        week_suffix = f" across {total_weeks} weeks" if total_weeks > 0 else ""
+        await send_discord_text(
+            channel,
+            f"Imported {label} - {total_days} days, {total_exercises} exercises{week_suffix}.",
+        )
+        return True
 
     async def _build_active_program_context(self, user_id: str) -> Optional[dict[str, Any]]:
         program = await self.db.get_active_program(user_id)
@@ -468,7 +547,14 @@ class ProgrammeCog(commands.Cog):
                 {
                     **day,
                     "day_number": day_number,
-                    "heading": self._format_program_day_heading(day_number, str(day["name"]), len(exercise_entries)),
+                    "heading": self._format_program_day_heading(
+                        day_number,
+                        str(day["name"]),
+                        len(exercise_entries),
+                        block=str(day.get("block") or "").strip() or None,
+                        week=self._int_or_none(day.get("week")),
+                        programmed_day_number=self._int_or_none(day.get("day_number")),
+                    ),
                     "exercises": exercise_entries,
                 }
             )
@@ -492,6 +578,11 @@ class ProgrammeCog(commands.Cog):
         current_day = context.get("current_day")
         if current_day is None:
             return f"{title}\nCurrent day: not set"
+        block = str(current_day.get("block") or "").strip()
+        week = self._int_or_none(current_day.get("week"))
+        programmed_day = self._int_or_none(current_day.get("day_number"))
+        if block and week is not None and programmed_day is not None:
+            return f"{title}\nCurrent day: {block} Week {week} Day {programmed_day} - {current_day['name']}"
         return f"{title}\nCurrent day: Day {current_day['day_number']} - {current_day['name']}"
 
     def _format_active_program_day_block(self, day: dict[str, Any]) -> str:
@@ -1662,7 +1753,10 @@ class ProgrammeCog(commands.Cog):
             return
 
         content = message.content.strip()
-        if not content or content.startswith(self.settings.command_prefix):
+        attachments = list(getattr(message, "attachments", []) or [])
+        if not content and not attachments:
+            return
+        if content.startswith(self.settings.command_prefix):
             return
 
         user_id = message.author.id
@@ -1675,6 +1769,12 @@ class ProgrammeCog(commands.Cog):
                 display_id = reverted.get("parent_display_id")
                 suffix = f" (ID {display_id})" if display_id else ""
                 await send_discord_text(message.channel, f"Welcome back! Reverted to {parent_name}{suffix}.")
+
+            logbook_attachment = next((attachment for attachment in attachments if self._attachment_looks_like_logbook(attachment)), None)
+            if logbook_attachment is not None:
+                imported = await self._import_structured_logbook_attachment(message.channel, message.author, logbook_attachment)
+                if imported:
+                    return
 
             pending_travel = self.pending_travel_context.get(user_id)
             if pending_travel:

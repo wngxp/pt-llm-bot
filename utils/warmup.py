@@ -47,3 +47,27 @@ def generate_warmup(working_weight: float, category: str, unit: str = "lbs") -> 
         return ["1-2 easy ramp sets"]
 
     return None
+
+
+def generate_pyramid_warmup(working_weight: float, warmup_sets: int, unit: str = "lbs") -> Optional[list[str]]:
+    if working_weight <= 0:
+        return None
+
+    count = max(1, min(4, int(warmup_sets or 0)))
+    step = 1.0 if str(unit).lower().startswith("kg") else 2.5
+    schemes = {
+        1: [(0.60, "6-10")],
+        2: [(0.50, "6-10"), (0.70, "4-6")],
+        3: [(0.45, "6-10"), (0.65, "4-6"), (0.85, "3-4")],
+        4: [(0.45, "6-10"), (0.60, "4-6"), (0.75, "3-5"), (0.85, "2-4")],
+    }
+
+    def rnd(weight: float) -> float:
+        return round(weight / step) * step
+
+    lines: list[str] = []
+    for index, (pct, rep_target) in enumerate(schemes[count], start=1):
+        rounded = rnd(working_weight * pct)
+        rep_text = rep_target.replace("-", "–")
+        lines.append(f"Warm-up set {index}: ~{format_standard_number(rounded)} {unit} × {rep_text} reps")
+    return lines

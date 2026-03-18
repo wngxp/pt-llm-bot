@@ -55,7 +55,10 @@ class Database:
             await self._migrate_user_state_table(conn)
             await self._ensure_multi_user_columns(conn)
             await self._ensure_program_display_ids(conn)
+            await self._ensure_program_day_tracking_columns(conn)
             await self._ensure_exercise_equipment_types(conn)
+            await self._ensure_exercise_programme_columns(conn)
+            await self._ensure_user_state_programme_columns(conn)
             await self._ensure_workout_log_snapshot_columns(conn)
             system_tz = self._detect_system_timezone()
             await conn.execute(
@@ -173,6 +176,19 @@ class Database:
             (default_value,),
         )
 
+    async def _ensure_column(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        rows = await self._fetchall(conn, f"PRAGMA table_info({table})")
+        cols = {str(r["name"]).lower() for r in rows}
+        if column.lower() not in cols:
+            await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     async def _ensure_multi_user_columns(self, conn: aiosqlite.Connection) -> None:
         await self._ensure_column_with_default(conn, table="programs", column="user_id")
         await self._ensure_column_with_default(conn, table="workout_logs", column="user_id")
@@ -269,6 +285,56 @@ class Database:
                 "UPDATE exercises SET equipment_type = ? WHERE id = ?",
                 (equipment_type, int(exercise["id"])),
             )
+
+    async def _ensure_program_day_tracking_columns(self, conn: aiosqlite.Connection) -> None:
+        await self._ensure_column(conn, table="program_days", column="block", definition="TEXT")
+        await self._ensure_column(conn, table="program_days", column="week", definition="INTEGER")
+        await self._ensure_column(conn, table="program_days", column="day_number", definition="INTEGER")
+        await self._ensure_column(conn, table="program_days", column="is_rest_day", definition="BOOLEAN DEFAULT 0")
+        await conn.execute(
+            """
+            UPDATE program_days
+            SET day_number = COALESCE(day_number, day_order + 1),
+                is_rest_day = COALESCE(is_rest_day, 0)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_program_days_program_block_week_day
+            ON program_days(program_id, block, week, day_number)
+            """
+        )
+
+    async def _ensure_exercise_programme_columns(self, conn: aiosqlite.Connection) -> None:
+        await self._ensure_column(conn, table="exercises", column="technique", definition="TEXT")
+        await self._ensure_column(conn, table="exercises", column="warmup_sets_low", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="warmup_sets_high", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="early_rpe_low", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="early_rpe_high", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="last_rpe_low", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="last_rpe_high", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="rest_low", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="rest_high", definition="INTEGER")
+        await self._ensure_column(conn, table="exercises", column="sub1", definition="TEXT")
+        await self._ensure_column(conn, table="exercises", column="sub2", definition="TEXT")
+
+    async def _ensure_user_state_programme_columns(self, conn: aiosqlite.Connection) -> None:
+        await self._ensure_column(conn, table="user_state", column="current_block", definition="TEXT")
+        await self._ensure_column(conn, table="user_state", column="current_week", definition="INTEGER")
+        await self._ensure_column(conn, table="user_state", column="current_day_number", definition="INTEGER")
+
+    def _position_fields_for_day(self, day: Optional[dict[str, Any]], *, fallback_index: int = 0) -> dict[str, Any]:
+        if not day:
+            return {
+                "current_block": None,
+                "current_week": None,
+                "current_day_number": fallback_index + 1,
+            }
+        return {
+            "current_block": day.get("block"),
+            "current_week": day.get("week"),
+            "current_day_number": day.get("day_number") if day.get("day_number") is not None else fallback_index + 1,
+        }
 
     async def _ensure_workout_log_snapshot_columns(self, conn: aiosqlite.Connection) -> None:
         rows = await self._fetchall(conn, "PRAGMA table_info(workout_logs)")
@@ -503,7 +569,39 @@ class Database:
         await self.update_user_state(user_id, timezone=timezone_name)
 
     async def set_current_day_index(self, day_index: int, user_id: Optional[str | int] = None) -> None:
-        await self.update_user_state(user_id, current_day_index=max(0, day_index))
+        normalized = self._normalize_user_id(user_id)
+        safe_index = max(0, int(day_index))
+        program = await self.get_active_program(normalized)
+        if not program:
+            await self.update_user_state(
+                normalized,
+                current_day_index=safe_index,
+                current_block=None,
+                current_week=None,
+                current_day_number=safe_index + 1,
+            )
+            return
+
+        days = await self.get_program_days(int(program["id"]))
+        if not days:
+            await self.update_user_state(
+                normalized,
+                current_day_index=safe_index,
+                current_block=None,
+                current_week=None,
+                current_day_number=safe_index + 1,
+            )
+            return
+
+        normalized_index = safe_index % len(days)
+        position = self._position_fields_for_day(days[normalized_index], fallback_index=normalized_index)
+        await self.update_user_state(
+            normalized,
+            current_day_index=normalized_index,
+            current_block=position["current_block"],
+            current_week=position["current_week"],
+            current_day_number=position["current_day_number"],
+        )
 
     async def set_current_day_for_active_program(self, day_order: int, user_id: Optional[str | int] = None) -> bool:
         program = await self.get_active_program(user_id)
@@ -683,8 +781,19 @@ class Database:
                 day_order = int(day.get("day_order", 0))
                 day_name = day.get("name") or f"Day {day_order + 1}"
                 day_cursor = await conn.execute(
-                    "INSERT INTO program_days (program_id, day_order, name) VALUES (?, ?, ?)",
-                    (program_id, day_order, day_name),
+                    """
+                    INSERT INTO program_days (program_id, day_order, name, block, week, day_number, is_rest_day)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        program_id,
+                        day_order,
+                        day_name,
+                        day.get("block"),
+                        day.get("week"),
+                        day.get("day_number"),
+                        int(bool(day.get("is_rest_day"))),
+                    ),
                 )
                 day_id = day_cursor.lastrowid
                 exercises = day.get("exercises") or []
@@ -693,8 +802,11 @@ class Database:
                         """
                         INSERT INTO exercises (
                             program_day_id, name, display_order, sets, rep_range_low,
-                            rep_range_high, category, equipment_type, superset_group, notes, muscle_groups
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            rep_range_high, category, equipment_type, superset_group, technique,
+                            warmup_sets_low, warmup_sets_high, early_rpe_low, early_rpe_high,
+                            last_rpe_low, last_rpe_high, rest_low, rest_high, sub1, sub2,
+                            notes, muscle_groups
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             day_id,
@@ -709,17 +821,37 @@ class Database:
                                 str(ex.get("category") or ""),
                             ),
                             ex.get("superset_group"),
+                            ex.get("technique"),
+                            ex.get("warmup_sets_low"),
+                            ex.get("warmup_sets_high"),
+                            ex.get("early_rpe_low"),
+                            ex.get("early_rpe_high"),
+                            ex.get("last_rpe_low"),
+                            ex.get("last_rpe_high"),
+                            ex.get("rest_low"),
+                            ex.get("rest_high"),
+                            ex.get("sub1"),
+                            ex.get("sub2"),
                             ex.get("notes") or "",
                             ex.get("muscle_groups") or "",
                         ),
                     )
 
             await conn.execute(
-                "UPDATE user_state SET current_program_id = ?, current_day_index = 0 WHERE user_id = ?",
+                """
+                UPDATE user_state
+                SET current_program_id = ?,
+                    current_day_index = 0,
+                    current_block = NULL,
+                    current_week = NULL,
+                    current_day_number = 1
+                WHERE user_id = ?
+                """,
                 (program_id, normalized),
             )
             await conn.commit()
-            return int(program_id)
+        await self.set_current_day_index(0, user_id=normalized)
+        return int(program_id)
 
     async def get_program_by_id(self, program_id: int) -> Optional[dict[str, Any]]:
         async with self.connect() as conn:
@@ -793,7 +925,40 @@ class Database:
             return None
         return days[day_index % len(days)]
 
-    async def advance_day_index(self, user_id: Optional[str | int] = None) -> int:
+    async def find_day_index_by_week_day(
+        self,
+        *,
+        week: int,
+        day_number: int,
+        user_id: Optional[str | int] = None,
+        block: Optional[str] = None,
+    ) -> Optional[int]:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return None
+        days = await self.get_program_days(int(program["id"]))
+        if not days:
+            return None
+
+        preferred_block = (block or "").strip()
+        if not preferred_block:
+            state = await self.get_user_state(user_id)
+            preferred_block = str(state.get("current_block") or "").strip()
+
+        matches = [
+            day for day in days
+            if int(day.get("week") or -1) == int(week)
+            and int(day.get("day_number") or -1) == int(day_number)
+        ]
+        if not matches:
+            return None
+        if preferred_block:
+            for day in matches:
+                if str(day.get("block") or "").strip().lower() == preferred_block.lower():
+                    return int(day["day_order"])
+        return int(matches[0]["day_order"])
+
+    async def advance_day_index(self, user_id: Optional[str | int] = None, *, skip_rest_days: bool = False) -> int:
         program = await self.get_active_program(user_id)
         if not program:
             return 0
@@ -803,7 +968,13 @@ class Database:
 
         current = await self.get_current_day_index(user_id)
         nxt = (current + 1) % len(days)
-        await self.update_user_state(user_id, current_day_index=nxt)
+        if skip_rest_days:
+            start_idx = nxt
+            while bool(days[nxt].get("is_rest_day")):
+                nxt = (nxt + 1) % len(days)
+                if nxt == start_idx:
+                    break
+        await self.set_current_day_index(nxt, user_id=user_id)
         return nxt
 
     async def get_last_logs_for_exercise(

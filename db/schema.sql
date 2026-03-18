@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS program_days (
     program_id INTEGER NOT NULL,
     day_order INTEGER NOT NULL,
     name TEXT NOT NULL,
+    block TEXT,
+    week INTEGER,
+    day_number INTEGER,
+    is_rest_day BOOLEAN DEFAULT 0,
     FOREIGN KEY (program_id) REFERENCES programs(id)
 );
 
@@ -35,6 +39,17 @@ CREATE TABLE IF NOT EXISTS exercises (
     category TEXT DEFAULT 'cable_machine',
     equipment_type TEXT DEFAULT 'unknown',
     superset_group INTEGER,
+    technique TEXT,
+    warmup_sets_low INTEGER,
+    warmup_sets_high INTEGER,
+    early_rpe_low INTEGER,
+    early_rpe_high INTEGER,
+    last_rpe_low INTEGER,
+    last_rpe_high INTEGER,
+    rest_low INTEGER,
+    rest_high INTEGER,
+    sub1 TEXT,
+    sub2 TEXT,
     notes TEXT,
     muscle_groups TEXT,
     FOREIGN KEY (program_day_id) REFERENCES program_days(id)
@@ -119,6 +134,9 @@ CREATE TABLE IF NOT EXISTS user_state (
     phase TEXT DEFAULT 'maintain',
     default_unit TEXT DEFAULT 'lbs',
     timezone TEXT DEFAULT 'UTC',
+    current_block TEXT,
+    current_week INTEGER,
+    current_day_number INTEGER,
     readiness INTEGER DEFAULT 7,
     weeks_since_deload INTEGER DEFAULT 0,
     current_streak INTEGER DEFAULT 0,

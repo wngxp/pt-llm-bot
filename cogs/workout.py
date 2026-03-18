@@ -16,6 +16,7 @@ from discord.ext import commands
 from llm.prompts import ASK_SYSTEM_PROMPT
 from utils.e1rm import epley_1rm
 from utils.discord_messages import send_discord_file, send_discord_text
+from utils.exercise_types import category_label_from_db, db_category_from_equipment_type, infer_equipment_type_from_name_and_category
 from utils.export import write_logs_csv
 from utils.formatters import format_exercise_brief, format_set_log
 from utils.input_parser import parse_cue, parse_extend_rest, parse_set_input
@@ -23,7 +24,7 @@ from utils.numbers import format_standard_number
 from utils.plates import plates_breakdown
 from utils.progression import suggest_weight
 from utils.volume import format_volume_report
-from utils.warmup import generate_warmup
+from utils.warmup import generate_pyramid_warmup, generate_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ REST_SECONDS_BY_CATEGORY = {
 }
 SUPERSET_ROUND_REST_SECONDS = 90
 READY_TOKENS = {"ready", "start", "lets go", "let's go", "go"}
+DONE_TOKENS = {"done", "ready", "ok", "okay"}
+SKIP_WARMUP_TOKENS = {"skip", "skip warmup", "skip warm up"}
 WEEKDAY_CHANNEL_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 WEEKDAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 EARLY_END_INTENTS = {
@@ -106,6 +109,13 @@ MAX_REPS = 200
 ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 SHORTHAND_SET_RE = re.compile(r"^(?P<weight>\d+(?:\.\d+)?)\s+(?P<reps>\d+)(?:\s+(?P<rir>\d+))?$")
 SAME_SET_RE = re.compile(r"^same(?:\s+(?P<arg>[+-]?\d+))?$", re.IGNORECASE)
+SUBSTITUTION_RE = re.compile(r"^sub\s*(?P<choice>[12])\b", re.IGNORECASE)
+START_WEEK_DAY_RE = re.compile(
+    r"^(?:start|begin)\s+(?:(?P<block>.+?)\s+)?week\s+(?P<week>\d+)\s+day\s+(?P<day>\d+)\b",
+    re.IGNORECASE,
+)
+WORKING_WEIGHT_RE = re.compile(r"^(?P<weight>\d+(?:\.\d+)?)\s*(?P<unit>kg|kgs|lb|lbs)?$", re.IGNORECASE)
+RPE_REPLY_RE = re.compile(r"^(?:rpe\s*)?(?P<value>10|[1-9](?:\.\d)?)$", re.IGNORECASE)
 EQUIPMENT_SWITCH_RE = re.compile(
     r"\b(?:switch to|use|do this on|make it|change to)\s+"
     r"(?P<equipment>smith machine|smith|barbell|dumbbell|cable|machine|bodyweight)\b",
@@ -137,6 +147,20 @@ class SupersetState:
 
 
 @dataclass(slots=True)
+class ExerciseWarmupState:
+    exercise_id: int
+    steps: list[str]
+    working_weight: float
+    unit: str
+    current_step: int = 0
+
+    def current_prompt(self) -> Optional[str]:
+        if self.current_step >= len(self.steps):
+            return None
+        return self.steps[self.current_step]
+
+
+@dataclass(slots=True)
 class WorkoutSession:
     user_id: str
     channel_id: int
@@ -159,6 +183,10 @@ class WorkoutSession:
     rest_seconds: int = 0
     day_activity_warning: Optional[str] = None
     day_injury_warning: Optional[str] = None
+    general_warmup_pending: bool = True
+    pending_working_weight_exercise_id: Optional[int] = None
+    exercise_warmup: Optional[ExerciseWarmupState] = None
+    pending_rpe_prompt: Optional[dict[str, Any]] = None
 
     def current_exercise(self) -> Optional[dict[str, Any]]:
         if self.superset:
@@ -296,6 +324,367 @@ class WorkoutCog(commands.Cog):
     def _exercise_base_name(self, exercise: dict[str, Any]) -> str:
         return str(exercise.get("base_name") or exercise.get("name") or "")
 
+    def _is_structured_program_day(self, day: dict[str, Any]) -> bool:
+        return any(day.get(field) is not None for field in ("block", "week", "day_number"))
+
+    def _is_structured_logbook_exercise(self, exercise: dict[str, Any]) -> bool:
+        fields = (
+            "technique",
+            "warmup_sets_low",
+            "warmup_sets_high",
+            "early_rpe_low",
+            "early_rpe_high",
+            "last_rpe_low",
+            "last_rpe_high",
+            "rest_low",
+            "rest_high",
+            "sub1",
+            "sub2",
+        )
+        return any(exercise.get(field) not in {None, ""} for field in fields)
+
+    def _format_program_position(self, day: dict[str, Any]) -> str:
+        block = str(day.get("block") or "").strip()
+        week = day.get("week")
+        day_number = day.get("day_number")
+        if block and week is not None and day_number is not None:
+            return f"{block} Week {int(week)} Day {int(day_number)}"
+        return f"Day {int(day.get('day_order') or 0) + 1}"
+
+    def _format_rep_target_text(self, low: Any, high: Any) -> str:
+        if low is None or high is None:
+            return "AMRAP"
+        if int(low) == int(high):
+            return str(int(low))
+        return f"{int(low)}-{int(high)}"
+
+    def _warmup_count(self, exercise: dict[str, Any]) -> int:
+        count = int(exercise.get("warmup_sets_low") or 0)
+        return max(0, count)
+
+    def _warmup_label(self, exercise: dict[str, Any]) -> Optional[str]:
+        low = exercise.get("warmup_sets_low")
+        high = exercise.get("warmup_sets_high")
+        if low is None:
+            return None
+        if high is not None and int(high) > int(low):
+            return f"{int(low)}-{int(high)} sets"
+        return f"{int(low)} sets"
+
+    def _substitution_options(self, exercise: dict[str, Any]) -> list[tuple[int, str]]:
+        options: list[tuple[int, str]] = []
+        sub1 = str(exercise.get("sub1") or "").strip()
+        sub2 = str(exercise.get("sub2") or "").strip()
+        if sub1:
+            options.append((1, sub1))
+        if sub2:
+            options.append((2, sub2))
+        return options
+
+    def _clear_exercise_prompt_state(self, session: WorkoutSession, *, exercise_id: Optional[int] = None) -> None:
+        if (
+            exercise_id is None
+            or session.pending_working_weight_exercise_id is None
+            or session.pending_working_weight_exercise_id == exercise_id
+        ):
+            session.pending_working_weight_exercise_id = None
+        if (
+            exercise_id is None
+            or session.exercise_warmup is None
+            or session.exercise_warmup.exercise_id == exercise_id
+        ):
+            session.exercise_warmup = None
+        if exercise_id is None or (
+            session.pending_rpe_prompt is not None
+            and int(session.pending_rpe_prompt.get("exercise_id") or -1) == int(exercise_id)
+        ):
+            session.pending_rpe_prompt = None
+
+    def _latest_planned_weight_from_logs(self, logs: list[dict[str, Any]]) -> tuple[Optional[float], Optional[str]]:
+        if not logs:
+            return None, None
+        latest_date = str(logs[0].get("date") or "")
+        latest_rows = [row for row in logs if str(row.get("date") or "") == latest_date]
+        weighted_rows = [row for row in latest_rows if float(row.get("weight") or 0.0) > 0]
+        if not weighted_rows:
+            return None, None
+        chosen = max(weighted_rows, key=lambda row: float(row.get("weight") or 0.0))
+        return float(chosen["weight"]), str(chosen.get("unit") or "lbs")
+
+    async def _default_unit_for_user(self, user_id: str) -> str:
+        state = await self.db.get_user_state(user_id)
+        default_unit = str(state.get("default_unit") or "lbs").strip().lower()
+        return "kg" if default_unit.startswith("kg") else "lbs"
+
+    def _parse_working_weight_reply(self, text: str, default_unit: str) -> Optional[tuple[float, str]]:
+        match = WORKING_WEIGHT_RE.fullmatch(text.strip())
+        if not match:
+            return None
+        unit_raw = str(match.group("unit") or "").lower()
+        unit = "kg" if unit_raw.startswith("kg") else "lbs"
+        if not unit_raw:
+            unit = default_unit
+        return float(match.group("weight")), unit
+
+    def _rest_seconds_for_exercise(self, exercise: dict[str, Any]) -> int:
+        rest_low = exercise.get("rest_low")
+        if rest_low is not None:
+            return max(0, int(rest_low) * 60)
+        category = str(exercise.get("category") or "cable_machine")
+        return REST_SECONDS_BY_CATEGORY.get(category, 90)
+
+    def _rest_target_label(self, exercise: dict[str, Any]) -> Optional[str]:
+        rest_low = exercise.get("rest_low")
+        rest_high = exercise.get("rest_high")
+        if rest_low is None:
+            return None
+        if rest_high is not None and int(rest_high) > int(rest_low):
+            return f"{int(rest_low)}-{int(rest_high)} min"
+        return f"{int(rest_low)} min"
+
+    def _rpe_target_text(self, low: Any, high: Any) -> Optional[str]:
+        if low is None:
+            return None
+        if high is None or int(high) == int(low):
+            return f"~{int(low)}"
+        return f"~{int(low)}-{int(high)}"
+
+    def _rpe_prompt_for_set(self, exercise: dict[str, Any], set_number: int) -> Optional[tuple[str, bool]]:
+        total_sets = int(exercise.get("sets") or 1)
+        if set_number < total_sets:
+            target = self._rpe_target_text(exercise.get("early_rpe_low"), exercise.get("early_rpe_high"))
+            if not target:
+                return None
+            return (
+                f"RPE check after set {set_number}: target {target}. Reply with your RPE or log the next set when ready.",
+                True,
+            )
+
+        target = self._rpe_target_text(exercise.get("last_rpe_low"), exercise.get("last_rpe_high"))
+        if not target:
+            return None
+        return (f"Last-set RPE target: {target}.", False)
+
+    def _technique_brief_reminder(self, technique: str) -> Optional[str]:
+        lowered = technique.lower()
+        if "llp" in lowered:
+            return "Go to failure, then immediately extend the set with lighter weight LLPs."
+        if "failure" in lowered:
+            return "Take the set to failure with clean form."
+        return None
+
+    def _last_set_technique_line(self, exercise: dict[str, Any], next_set: int) -> Optional[str]:
+        total_sets = int(exercise.get("sets") or 1)
+        if next_set != total_sets:
+            return None
+        technique = str(exercise.get("technique") or "").strip()
+        if not technique or technique.lower() == "n/a":
+            return None
+        reminder = self._technique_brief_reminder(technique)
+        if reminder:
+            return f"Last set - {technique}. {reminder}"
+        return f"Last set - {technique}."
+
+    async def _build_exercise_warmup_state(
+        self,
+        session: WorkoutSession,
+        exercise: dict[str, Any],
+        logs: list[dict[str, Any]],
+    ) -> Optional[ExerciseWarmupState]:
+        warmup_sets = self._warmup_count(exercise)
+        if warmup_sets <= 0:
+            return None
+        planned_weight, unit = self._latest_planned_weight_from_logs(logs)
+        if planned_weight is None or not unit:
+            return None
+        session.exercise_units[int(exercise["id"])] = unit
+        steps = generate_pyramid_warmup(planned_weight, warmup_sets, unit)
+        if not steps:
+            return None
+        return ExerciseWarmupState(
+            exercise_id=int(exercise["id"]),
+            steps=steps,
+            working_weight=planned_weight,
+            unit=unit,
+        )
+
+    async def _send_general_warmup(self, channel: discord.abc.Messageable) -> None:
+        await send_discord_text(
+            channel,
+            '🔥 **General warm-up** (5-10 min):\n'
+            "5-10 min light cardio · 10/side arm swings · 10/side arm circles\n"
+            "10/side front-to-back leg swings · 10/side side-to-side leg swings\n"
+            'Reply "done" when ready.',
+        )
+
+    async def _handle_general_warmup_message(
+        self,
+        channel: discord.abc.Messageable,
+        session: WorkoutSession,
+        text: str,
+    ) -> bool:
+        lowered = self._normalize_user_text(text)
+        if lowered in DONE_TOKENS or lowered in SKIP_WARMUP_TOKENS:
+            session.general_warmup_pending = False
+            await self._prompt_current_exercise(channel, session, intro=True)
+            return True
+        await send_discord_text(channel, 'Reply "done" when you are ready to start the first exercise.')
+        return True
+
+    async def _handle_pending_working_weight_message(
+        self,
+        channel: discord.abc.Messageable,
+        session: WorkoutSession,
+        text: str,
+    ) -> bool:
+        exercise = session.current_exercise()
+        if exercise is None or session.pending_working_weight_exercise_id != int(exercise["id"]):
+            session.pending_working_weight_exercise_id = None
+            return False
+        default_unit = await self._default_unit_for_user(session.user_id)
+        parsed = self._parse_working_weight_reply(text, default_unit)
+        if parsed is None:
+            return False
+        working_weight, unit = parsed
+        if abs(working_weight) > MAX_WEIGHT_BY_UNIT.get(unit, 1500.0):
+            await send_discord_text(channel, "That working weight seems unrealistic. Please double-check.")
+            return True
+        session.exercise_units[int(exercise["id"])] = unit
+        steps = generate_pyramid_warmup(working_weight, self._warmup_count(exercise), unit)
+        session.pending_working_weight_exercise_id = None
+        if not steps:
+            return False
+        session.exercise_warmup = ExerciseWarmupState(
+            exercise_id=int(exercise["id"]),
+            steps=steps,
+            working_weight=working_weight,
+            unit=unit,
+        )
+        prompt = session.exercise_warmup.current_prompt()
+        if prompt:
+            await send_discord_text(
+                channel,
+                f"{prompt}\nReply `done` when finished, `skip` to move to working sets, or just log your first set.",
+            )
+            return True
+        return False
+
+    async def _handle_exercise_warmup_message(
+        self,
+        channel: discord.abc.Messageable,
+        session: WorkoutSession,
+        text: str,
+    ) -> bool:
+        warmup = session.exercise_warmup
+        exercise = session.current_exercise()
+        lowered = self._normalize_user_text(text)
+        if warmup is None or exercise is None or warmup.exercise_id != int(exercise["id"]):
+            if warmup is not None and exercise is not None and warmup.exercise_id != int(exercise["id"]):
+                session.exercise_warmup = None
+            return False
+        if lowered in SKIP_WARMUP_TOKENS:
+            session.exercise_warmup = None
+            await send_discord_text(channel, self._current_set_prompt(session))
+            return True
+        if lowered not in DONE_TOKENS:
+            return False
+
+        warmup.current_step += 1
+        prompt = warmup.current_prompt()
+        if prompt:
+            await send_discord_text(channel, f"{prompt}\nReply `done` when finished or `skip` to move on.")
+            return True
+
+        session.exercise_warmup = None
+        await send_discord_text(channel, self._current_set_prompt(session))
+        return True
+
+    async def _handle_pending_rpe_reply(
+        self,
+        channel: discord.abc.Messageable,
+        session: WorkoutSession,
+        text: str,
+    ) -> bool:
+        prompt = session.pending_rpe_prompt
+        if not prompt:
+            return False
+        lowered = self._normalize_user_text(text)
+        if lowered in {"skip", "skip rpe"}:
+            session.pending_rpe_prompt = None
+            await send_discord_text(channel, "Skipped RPE check.")
+            return True
+        match = RPE_REPLY_RE.fullmatch(text.strip())
+        if not match:
+            return False
+        session.pending_rpe_prompt = None
+        await send_discord_text(
+            channel,
+            f"Noted RPE {match.group('value')} for set {prompt['set_number']} of {prompt['exercise_name']}.",
+        )
+        return True
+
+    async def _handle_substitution_request(
+        self,
+        channel: discord.abc.Messageable,
+        session: WorkoutSession,
+        text: str,
+    ) -> bool:
+        match = SUBSTITUTION_RE.fullmatch(text.strip())
+        if not match:
+            return False
+        current = session.current_exercise()
+        if current is None:
+            return False
+        choice = int(match.group("choice"))
+        replacement = str(current.get(f"sub{choice}") or "").strip()
+        if not replacement:
+            available = ", ".join(f"sub {idx}" for idx, _ in self._substitution_options(current))
+            if available:
+                await send_discord_text(channel, f"That substitution isn't available here. Options: {available}.")
+            else:
+                await send_discord_text(channel, "No substitutions are saved for this exercise.")
+            return True
+
+        equipment_type = infer_equipment_type_from_name_and_category(replacement, str(current.get("category") or ""))
+        current["name"] = replacement
+        current["category"] = db_category_from_equipment_type(
+            replacement,
+            equipment_type,
+            fallback=str(current.get("base_category") or current.get("category") or ""),
+        )
+        current["equipment_type"] = equipment_type
+        current["session_override"] = True
+        self._clear_exercise_prompt_state(session, exercise_id=int(current["id"]))
+
+        await self._cancel_rest(session)
+        await send_discord_text(
+            channel,
+            f"Switched to {replacement}. Logging remaining sets under that name.",
+        )
+        await self._prompt_current_exercise(channel, session)
+        return True
+
+    async def _jump_to_program_position(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        user_id: str,
+        text: str,
+    ) -> bool:
+        match = START_WEEK_DAY_RE.fullmatch(text.strip())
+        if not match:
+            return False
+        block = str(match.group("block") or "").strip() or None
+        week = int(match.group("week"))
+        day_number = int(match.group("day"))
+        idx = await self.db.find_day_index_by_week_day(week=week, day_number=day_number, user_id=user_id, block=block)
+        if idx is None:
+            await send_discord_text(channel, "I couldn't find that week/day in your active program.")
+            return True
+        await self.db.set_current_day_index(idx, user_id=user_id)
+        await self._start_session(channel, user_id=user_id)
+        return True
+
     def _find_last_logged_set_for_current_exercise(self, session: WorkoutSession) -> Optional[dict[str, Any]]:
         current = session.current_exercise()
         if not current:
@@ -417,7 +806,11 @@ class WorkoutCog(commands.Cog):
             return "Workout complete."
         done_sets = int(session.set_counts.get(int(current["id"]), 0))
         total_sets = int(current.get("sets") or 1)
-        return f"Ready for set {done_sets + 1}/{total_sets} of {current['name']} when you are."
+        line = f"Ready for set {done_sets + 1}/{total_sets} of {current['name']} when you are."
+        technique_line = self._last_set_technique_line(current, done_sets + 1)
+        if technique_line:
+            return f"{line}\n{technique_line}"
+        return line
 
     def _category_from_equipment_switch(self, exercise: dict[str, Any], equipment_type: str) -> str:
         normalized = str(equipment_type or "").strip().lower()
@@ -559,9 +952,9 @@ class WorkoutCog(commands.Cog):
                 f"(Longest: {streak['longest_streak']})."
             )
 
-        next_index = await self.db.advance_day_index(user_id=session.user_id)
+        next_index = await self.db.advance_day_index(user_id=session.user_id, skip_rest_days=True)
         next_day = await self.db.get_day_for_index(next_index, user_id=session.user_id)
-        next_name = str(next_day["name"]) if next_day else "next day"
+        next_name = self._format_program_position(next_day) if next_day else "next day"
         progress_line = (
             f"No exercises completed in this session."
             if completed == 0
@@ -738,9 +1131,25 @@ class WorkoutCog(commands.Cog):
             await send_discord_text(channel, "Active program has no days configured.")
             return None
 
+        if bool(day.get("is_rest_day")):
+            skipped_position = self._format_program_position(day)
+            next_index = await self.db.advance_day_index(user_id=user_id, skip_rest_days=True)
+            day = await self.db.get_day_for_index(next_index, user_id=user_id)
+            if not day:
+                await send_discord_text(channel, f"{skipped_position} is a rest day. No training day is queued next.")
+                return None
+            day_index = next_index
+            await send_discord_text(
+                channel,
+                f"{skipped_position} is a rest day. Skipping to {self._format_program_position(day)} - {day['name']}.",
+            )
+
         exercises = await self.db.get_exercises_for_day(int(day["id"]))
         if not exercises:
-            await send_discord_text(channel, f"{day['name']} has no exercises.")
+            if bool(day.get("is_rest_day")):
+                await send_discord_text(channel, f"{self._format_program_position(day)} is marked as a rest day.")
+            else:
+                await send_discord_text(channel, f"{day['name']} has no exercises.")
             return None
         for exercise in exercises:
             exercise["base_name"] = str(exercise.get("name") or "")
@@ -762,9 +1171,10 @@ class WorkoutCog(commands.Cog):
         self._clear_early_end_prompt((session.channel_id, int(session.user_id)))
 
         total_days = len(await self.db.get_program_days(program["id"]))
+        position = self._format_program_position(day)
         await send_discord_text(
             channel,
-            f"Starting **{day['name']}** (Day {day_index + 1} of {total_days})."
+            f"Starting **{day['name']}** ({position}, slot {day_index + 1} of {total_days})."
         )
 
         session.day_activity_warning = await self._day_activity_warning(exercises, user_id=user_id)
@@ -785,7 +1195,7 @@ class WorkoutCog(commands.Cog):
                     f"You missed yesterday's session. Continuing sequential order with **{day['name']}** today."
                 )
 
-        await self._prompt_current_exercise(channel, session, intro=True)
+        await self._send_general_warmup(channel)
         return session
 
     async def _prompt_current_exercise(
@@ -806,15 +1216,23 @@ class WorkoutCog(commands.Cog):
         if exercise is None:
             await self._complete_session(channel, session)
             return
+        exercise_id = int(exercise["id"])
+        if session.exercise_warmup is not None and session.exercise_warmup.exercise_id != exercise_id:
+            session.exercise_warmup = None
+        if session.pending_working_weight_exercise_id not in {None, exercise_id}:
+            session.pending_working_weight_exercise_id = None
+        if session.pending_rpe_prompt is not None and int(session.pending_rpe_prompt.get("exercise_id") or -1) != exercise_id:
+            session.pending_rpe_prompt = None
 
         if bool(exercise.get("session_override")):
             logs = await self.db.get_last_logs_for_named_exercise(str(exercise["name"]), limit=3, user_id=session.user_id)
         else:
-            logs = await self.db.get_last_logs_for_exercise(int(exercise["id"]), limit=3, user_id=session.user_id)
+            logs = await self.db.get_last_logs_for_exercise(exercise_id, limit=3, user_id=session.user_id)
         activity_multiplier, activity_note = await self._activity_adjustment_for_exercise(exercise, user_id=session.user_id)
         injury_note = await self._injury_warning_for_exercise(exercise, user_id=session.user_id)
         state = await self.db.get_user_state(session.user_id)
         readiness = int(state.get("readiness") or 7)
+        default_unit = "kg" if str(state.get("default_unit") or "lbs").lower().startswith("kg") else "lbs"
         readiness_multiplier = 1.0
         readiness_note: Optional[str] = None
         if readiness >= 8:
@@ -831,6 +1249,8 @@ class WorkoutCog(commands.Cog):
                 f"⚠️ Readiness is very low ({readiness}/10). Consider a light technique session or rest."
             )
 
+        next_set = session.set_counts[exercise_id] + 1
+        structured_logbook = self._is_structured_program_day(session.day) or self._is_structured_logbook_exercise(exercise)
         final_multiplier = activity_multiplier * readiness_multiplier
         suggestion = suggest_weight(exercise, logs, adjustment_multiplier=final_multiplier)
         if not logs and readiness <= 5:
@@ -854,11 +1274,16 @@ class WorkoutCog(commands.Cog):
 
         warmup = None
         category = str(exercise.get("category") or "cable_machine")
-        if category in {"heavy_barbell", "light_barbell"} and logs:
+        if not structured_logbook and category in {"heavy_barbell", "light_barbell"} and logs:
             basis_weight = float(logs[0]["weight"]) * final_multiplier
             basis_unit = str(logs[0].get("unit") or "lbs")
             if basis_weight > 0:
                 warmup = generate_warmup(basis_weight, category, basis_unit)
+        elif structured_logbook and next_set == 1 and self._warmup_count(exercise) > 0:
+            if session.exercise_warmup is None and session.pending_working_weight_exercise_id is None:
+                session.exercise_warmup = await self._build_exercise_warmup_state(session, exercise, logs)
+                if session.exercise_warmup is None:
+                    session.pending_working_weight_exercise_id = exercise_id
 
         cue = await self.db.get_latest_cue(str(exercise["name"]), user_id=session.user_id)
 
@@ -880,17 +1305,50 @@ class WorkoutCog(commands.Cog):
             lines.append(injury_note)
         if readiness_note:
             lines.append(readiness_note)
-        lines.append(format_exercise_brief(exercise))
-        lines.extend(last_lines)
-        lines.append(f"Suggestion: {suggestion}")
-        if warmup:
-            lines.append(f"Warm-up: {', '.join(warmup)}")
-        if cue:
-            lines.append(f"💡 Cue: {cue}")
 
-        next_set = session.set_counts[int(exercise["id"])] + 1
-        session.presented_exercises.add(int(exercise["id"]))
-        lines.append(f"Log set {next_set}/{exercise['sets']} as `weight x reps` (optionally `@rir`).")
+        if structured_logbook:
+            rep_target = self._format_rep_target_text(exercise.get("rep_range_low"), exercise.get("rep_range_high"))
+            lines.append(f"**Next up: {exercise['name']}** ({exercise['sets']} sets x {rep_target} reps)")
+            meta_parts: list[str] = []
+            warmup_label = self._warmup_label(exercise)
+            if warmup_label:
+                meta_parts.append(f"Warm-up: {warmup_label}")
+            substitution_options = self._substitution_options(exercise)
+            if substitution_options:
+                option_label = "Sub options" if len(substitution_options) > 1 else "Sub option"
+                meta_parts.append(f"{option_label}: {' | '.join(name for _, name in substitution_options)}")
+            if meta_parts:
+                lines.append(" · ".join(meta_parts))
+            if substitution_options:
+                available_refs = " or ".join(f'"sub {index}"' for index, _ in substitution_options)
+                lines.append(f"↳ Say {available_refs} to switch, or just log your first set.")
+            lines.extend(last_lines)
+            lines.append(f"Suggestion: {suggestion}")
+            if cue:
+                lines.append(f"💡 Cue: {cue}")
+            technique_line = self._last_set_technique_line(exercise, next_set)
+            if technique_line:
+                lines.append(technique_line)
+            warmup_prompt = session.exercise_warmup.current_prompt() if session.exercise_warmup else None
+            if next_set == 1 and warmup_prompt:
+                lines.append(warmup_prompt)
+                lines.append("Reply `done` when finished, `skip` to move to working sets, or just log your first set.")
+            elif next_set == 1 and session.pending_working_weight_exercise_id == exercise_id:
+                lines.append(
+                    f"What working weight are you planning for {exercise['name']}? Reply like `100 {default_unit}`."
+                )
+            lines.append(f"Log set {next_set}/{exercise['sets']} as `weight x reps` (optionally `@rir`).")
+        else:
+            lines.append(format_exercise_brief(exercise))
+            lines.extend(last_lines)
+            lines.append(f"Suggestion: {suggestion}")
+            if warmup:
+                lines.append(f"Warm-up: {', '.join(warmup)}")
+            if cue:
+                lines.append(f"💡 Cue: {cue}")
+            lines.append(f"Log set {next_set}/{exercise['sets']} as `weight x reps` (optionally `@rir`).")
+
+        session.presented_exercises.add(exercise_id)
         await send_discord_text(channel, "\n".join(lines))
 
     def _ensure_superset_initialized(self, session: WorkoutSession) -> None:
@@ -999,7 +1457,7 @@ class WorkoutCog(commands.Cog):
         await self._cancel_rest(session)
         summary = self._build_session_summary(session)
         streak = await self.db.mark_workout_completed(date.today(), user_id=session.user_id)
-        await self.db.advance_day_index(user_id=session.user_id)
+        await self.db.advance_day_index(user_id=session.user_id, skip_rest_days=True)
         self.sessions.pop(session.user_id, None)
         self._clear_early_end_prompt((session.channel_id, int(session.user_id)))
 
@@ -1280,10 +1738,10 @@ class WorkoutCog(commands.Cog):
         )
 
     def _exercise_type_label(self, exercise: dict[str, Any]) -> str:
-        equipment_type = str(exercise.get("equipment_type") or "").strip().lower()
-        if equipment_type:
-            return equipment_type.replace("_", " ")
-        return str(exercise.get("category") or "cable_machine").replace("_", " ")
+        return category_label_from_db(
+            str(exercise.get("category") or "cable_machine"),
+            str(exercise.get("equipment_type") or ""),
+        )
 
     def _is_pr_announce_exercise(self, exercise_name: str, category: str, equipment_type: str) -> bool:
         lowered = exercise_name.lower()
@@ -1614,6 +2072,8 @@ class WorkoutCog(commands.Cog):
             await self._prompt_current_exercise(channel, session)
             return
 
+        self._clear_exercise_prompt_state(session, exercise_id=ex_id)
+
         unit = await self._resolve_unit(channel, session, ex_id, parsed)
         if not unit:
             return
@@ -1700,6 +2160,17 @@ class WorkoutCog(commands.Cog):
             set_message = f"{set_message} | {short_pr}"
         await send_discord_text(channel, set_message)
 
+        rpe_prompt = self._rpe_prompt_for_set(target, set_number)
+        if rpe_prompt:
+            prompt_text, allow_reply = rpe_prompt
+            await send_discord_text(channel, prompt_text)
+            if allow_reply:
+                session.pending_rpe_prompt = {
+                    "exercise_id": ex_id,
+                    "exercise_name": str(target["name"]),
+                    "set_number": set_number,
+                }
+
         await self._apply_fatigue_adjustment_if_needed(channel, session.user_id, trailing_text)
 
         cue = parse_cue(parsed.get("raw", ""))
@@ -1739,19 +2210,23 @@ class WorkoutCog(commands.Cog):
             await self._advance_superset(channel, session)
             return
 
-        rest = REST_SECONDS_BY_CATEGORY.get(category, 90)
+        rest = self._rest_seconds_for_exercise(target)
+        rest_label = self._rest_target_label(target)
 
         is_last_set_for_exercise = set_number >= total_sets
         is_last_exercise_of_day = session.current_index >= len(session.exercises) - 1
 
         if not is_last_set_for_exercise:
+            rest_message = f"⏱️ Rest {rest // 60}:{rest % 60:02d} before set {set_number + 1}/{total_sets} of {target['name']}..."
+            if rest_label and rest > 0:
+                rest_message = f"{rest_message}\nTarget rest: {rest_label}."
             await self._start_rest(
                 channel,
                 session,
                 rest,
                 f"{target['name']} set {set_number + 1}/{total_sets}.",
                 prompt_on_ready=False,
-                rest_message=f"⏱️ Rest {rest // 60}:{rest % 60:02d} before set {set_number + 1}/{total_sets} of {target['name']}...",
+                rest_message=rest_message,
             )
             return
 
@@ -1764,6 +2239,8 @@ class WorkoutCog(commands.Cog):
         next_name = next_ex["name"] if next_ex else "next exercise"
         preview = await self._preview_next_exercise(session)
         rest_message = f"⏱️ Rest {rest // 60}:{rest % 60:02d} before the next exercise..."
+        if rest_label and rest > 0:
+            rest_message = f"{rest_message}\nTarget rest: {rest_label}."
         if preview:
             rest_message = f"{rest_message}\n{preview}"
         await self._start_rest(
@@ -1932,6 +2409,7 @@ class WorkoutCog(commands.Cog):
         current["category"] = self._category_from_equipment_switch(current, equipment_type)
         current["equipment_type"] = equipment_type
         current["session_override"] = variant_name != self._exercise_base_name(current) or equipment_type != str(current.get("base_equipment_type") or "").strip().lower()
+        self._clear_exercise_prompt_state(session, exercise_id=int(current["id"]))
 
         await self._cancel_rest(session)
         history = await self.db.get_last_logs_for_named_exercise(variant_name, limit=1, user_id=session.user_id)
@@ -1993,6 +2471,7 @@ class WorkoutCog(commands.Cog):
         moved = session.exercises.pop(match_idx)
         session.exercises.insert(session.current_index, moved)
         await self._cancel_rest(session)
+        self._clear_exercise_prompt_state(session)
         await send_discord_text(channel, f"🔀 Moving **{moved['name']}** up next. You'll do the skipped exercises after.")
         await self._prompt_current_exercise(channel, session)
         return True
@@ -2006,6 +2485,7 @@ class WorkoutCog(commands.Cog):
         done = int(session.set_counts.get(ex_id, 0))
         total = int(current.get("sets") or 1)
         await self._cancel_rest(session)
+        self._clear_exercise_prompt_state(session, exercise_id=ex_id)
         if session.superset:
             session.set_counts[ex_id] = total
             await send_discord_text(channel, f"{current['name']}: {done}/{total} sets completed. Moving on.")
@@ -2065,9 +2545,10 @@ class WorkoutCog(commands.Cog):
             await send_discord_text(channel, "Current session ended before applying day change.")
 
         await self.db.set_current_day_index(idx, user_id=user_id)
+        day_label = self._format_program_position(days[idx])
         await send_discord_text(
             channel,
-            f"Skipped to Day {idx + 1} - {days[idx]['name']}. Type `ready` to start.",
+            f"Skipped to {day_label} - {days[idx]['name']}. Type `ready` to start.",
         )
 
     @commands.command(name="start")
@@ -2349,6 +2830,8 @@ class WorkoutCog(commands.Cog):
         if not session:
             if not await self._check_weekday_start_channel(message.channel, user_id):
                 return
+            if await self._jump_to_program_position(message.channel, user_id=user_id, text=content):
+                return
             if lowered in READY_TOKENS:
                 await self._start_session(message.channel, user_id=user_id)
                 return
@@ -2363,6 +2846,10 @@ class WorkoutCog(commands.Cog):
             session = self.sessions.get(user_id)
             if not session:
                 await send_discord_text(message.channel, "Type `ready` to start today's workout.")
+                return
+
+            if session.general_warmup_pending:
+                await self._handle_general_warmup_message(message.channel, session, content)
                 return
 
             handled_early_end = await self._handle_early_end_prompt(
@@ -2393,6 +2880,18 @@ class WorkoutCog(commands.Cog):
                     message.channel,
                     "Session is paused. Type `ready` to resume or `move on` to end and advance."
                 )
+                return
+
+            if await self._handle_pending_rpe_reply(message.channel, session, content):
+                return
+
+            if await self._handle_substitution_request(message.channel, session, content):
+                return
+
+            if await self._handle_pending_working_weight_message(message.channel, session, content):
+                return
+
+            if await self._handle_exercise_warmup_message(message.channel, session, content):
                 return
 
             if lowered == "skip rest":
@@ -2452,6 +2951,7 @@ class WorkoutCog(commands.Cog):
                         "Rest timer is active. Wait for the prompt or type `skip rest`."
                     )
                     return
+                session.pending_rpe_prompt = None
                 parsed["raw"] = content
                 await self._handle_logged_set(
                     message.channel,
