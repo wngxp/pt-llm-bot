@@ -1,3 +1,15 @@
+## [0.6.5] - 2026-03-31
+### Fixed
+- Structured JN logbook import now reports honest CSV counts from the real fixture: `432` source rows, `408` exercise entries, `84` unique days, `24` rest days, and `60` training days, instead of treating blank rest-day rows as exercises.
+- Structured CSV import now preserves Foundation/Ramping week layout correctly, including rest-day rows and block week counts (`Foundation=5`, `Ramping=7`).
+- Workout, `#ask`, and `#coach` context now include the current program block/week/day so week-specific guidance is anchored to the active training position.
+
+### Added
+- New week/block guidance helpers in `utils/week_context.py` for week-aware intros, context injection, and program-position lookups.
+- `program_start_date` persistence plus `!startdate YYYY-MM-DD` overrides so imported programs can map real calendar dates back to program weeks and days.
+- New `!backfill week <W> day <D>` and `!backfill yesterday` flows, including overwrite confirmation and rest-day rejection, for logging missed sessions against the correct program slot.
+- Import confirmations in `#programme` now surface both exercise totals and raw source-row totals for structured JN CSV imports.
+
 ## [0.6.4] - 2026-03-17
 ### Fixed
 - Increased the `#coach` response cap so longer coaching replies are less likely to be cut off by the LLM token limit before Discord message splitting runs.
