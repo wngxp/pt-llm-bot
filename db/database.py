@@ -322,6 +322,7 @@ class Database:
         await self._ensure_column(conn, table="user_state", column="current_block", definition="TEXT")
         await self._ensure_column(conn, table="user_state", column="current_week", definition="INTEGER")
         await self._ensure_column(conn, table="user_state", column="current_day_number", definition="INTEGER")
+        await self._ensure_column(conn, table="user_state", column="program_start_date", definition="TEXT")
 
     def _position_fields_for_day(self, day: Optional[dict[str, Any]], *, fallback_index: int = 0) -> dict[str, Any]:
         if not day:
@@ -502,6 +503,15 @@ class Database:
             return name
         return "UTC"
 
+    def _parse_iso_date(self, raw: Any) -> Optional[date]:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
     async def get_or_create_user_state(self, user_id: Optional[str | int] = None) -> dict[str, Any]:
         normalized = self._normalize_user_id(user_id)
         async with self.connect() as conn:
@@ -567,6 +577,19 @@ class Database:
 
     async def set_user_timezone(self, timezone_name: str, user_id: Optional[str | int] = None) -> None:
         await self.update_user_state(user_id, timezone=timezone_name)
+
+    async def get_program_start_date(self, user_id: Optional[str | int] = None) -> Optional[date]:
+        state = await self.get_user_state(user_id)
+        return self._parse_iso_date(state.get("program_start_date"))
+
+    async def set_program_start_date(self, start_date: date | str, user_id: Optional[str | int] = None) -> None:
+        if isinstance(start_date, date):
+            value = start_date.isoformat()
+        else:
+            value = str(start_date).strip()
+            if not self._parse_iso_date(value):
+                raise ValueError("program_start_date must be YYYY-MM-DD")
+        await self.update_user_state(user_id, program_start_date=value)
 
     async def set_current_day_index(self, day_index: int, user_id: Optional[str | int] = None) -> None:
         normalized = self._normalize_user_id(user_id)
@@ -755,10 +778,16 @@ class Database:
         temporary: bool = False,
         parent_program_id: Optional[int] = None,
         expires_at: Optional[str] = None,
+        program_start_date: Optional[str] = None,
     ) -> int:
         normalized = self._normalize_user_id(user_id)
         program_name = payload.get("program_name") or "Untitled Program"
         days = payload.get("days") or []
+        start_date_to_set = program_start_date
+        if start_date_to_set is None and not temporary:
+            start_date_to_set = date.today().isoformat()
+        if start_date_to_set is not None and not self._parse_iso_date(start_date_to_set):
+            raise ValueError("program_start_date must be YYYY-MM-DD")
         async with self.connect() as conn:
             await self._ensure_user_state(conn, normalized)
             await conn.execute("UPDATE programs SET active = 0 WHERE active = 1 AND user_id = ?", (normalized,))
@@ -837,18 +866,33 @@ class Database:
                         ),
                     )
 
-            await conn.execute(
-                """
-                UPDATE user_state
-                SET current_program_id = ?,
-                    current_day_index = 0,
-                    current_block = NULL,
-                    current_week = NULL,
-                    current_day_number = 1
-                WHERE user_id = ?
-                """,
-                (program_id, normalized),
-            )
+            if start_date_to_set is None:
+                await conn.execute(
+                    """
+                    UPDATE user_state
+                    SET current_program_id = ?,
+                        current_day_index = 0,
+                        current_block = NULL,
+                        current_week = NULL,
+                        current_day_number = 1
+                    WHERE user_id = ?
+                    """,
+                    (program_id, normalized),
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE user_state
+                    SET current_program_id = ?,
+                        current_day_index = 0,
+                        current_block = NULL,
+                        current_week = NULL,
+                        current_day_number = 1,
+                        program_start_date = ?
+                    WHERE user_id = ?
+                    """,
+                    (program_id, start_date_to_set, normalized),
+                )
             await conn.commit()
         await self.set_current_day_index(0, user_id=normalized)
         return int(program_id)
@@ -924,6 +968,47 @@ class Database:
         if not days:
             return None
         return days[day_index % len(days)]
+
+    async def get_program_total_weeks(self, user_id: Optional[str | int] = None) -> int:
+        program = await self.get_active_program(user_id)
+        if not program:
+            return 0
+        days = await self.get_program_days(int(program["id"]))
+        unique_weeks = {
+            (str(day.get("block") or "").strip(), int(day.get("week") or -1))
+            for day in days
+            if day.get("week") is not None
+        }
+        return len(unique_weeks)
+
+    async def get_program_day_by_week_day(
+        self,
+        *,
+        week: int,
+        day_number: int,
+        user_id: Optional[str | int] = None,
+        block: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        idx = await self.find_day_index_by_week_day(
+            week=week,
+            day_number=day_number,
+            user_id=user_id,
+            block=block,
+        )
+        if idx is None:
+            return None
+        return await self.get_day_for_index(idx, user_id=user_id)
+
+    async def get_program_day_date(
+        self,
+        day_order: int,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> Optional[date]:
+        start_date = await self.get_program_start_date(user_id)
+        if start_date is None:
+            return None
+        return start_date + timedelta(days=max(0, int(day_order)))
 
     async def find_day_index_by_week_day(
         self,
@@ -1274,6 +1359,114 @@ class Database:
                 (day["id"], normalized),
             )
         return [dict(r) for r in rows]
+
+    async def get_logs_for_program_day(
+        self,
+        program_day_id: int,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> list[dict[str, Any]]:
+        normalized = self._normalize_user_id(user_id)
+        async with self.connect() as conn:
+            rows = await self._fetchall(
+                conn,
+                """
+                SELECT wl.*,
+                       COALESCE(wl.performed_exercise_name, e.name) AS exercise_name
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE e.program_day_id = ?
+                  AND wl.user_id = ?
+                ORDER BY wl.date ASC, wl.exercise_id ASC, wl.set_number ASC, wl.id ASC
+                """,
+                (program_day_id, normalized),
+            )
+        return [dict(r) for r in rows]
+
+    async def count_logged_sets_for_program_day(
+        self,
+        program_day_id: int,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> int:
+        normalized = self._normalize_user_id(user_id)
+        async with self.connect() as conn:
+            row = await self._fetchone(
+                conn,
+                """
+                SELECT COUNT(*) AS logged_sets
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE e.program_day_id = ?
+                  AND wl.user_id = ?
+                """,
+                (program_day_id, normalized),
+            )
+        return int(row["logged_sets"] or 0) if row else 0
+
+    async def clear_logs_for_program_day(
+        self,
+        program_day_id: int,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> int:
+        normalized = self._normalize_user_id(user_id)
+        async with self.connect() as conn:
+            rows = await self._fetchall(
+                conn,
+                """
+                SELECT wl.id
+                FROM workout_logs wl
+                JOIN exercises e ON e.id = wl.exercise_id
+                WHERE e.program_day_id = ?
+                  AND wl.user_id = ?
+                """,
+                (program_day_id, normalized),
+            )
+            log_ids = [int(row["id"]) for row in rows]
+            if not log_ids:
+                return 0
+            placeholders = ",".join("?" for _ in log_ids)
+            await conn.execute(
+                f"DELETE FROM personal_records WHERE workout_log_id IN ({placeholders}) AND user_id = ?",
+                [*log_ids, normalized],
+            )
+            cursor = await conn.execute(
+                f"DELETE FROM workout_logs WHERE id IN ({placeholders}) AND user_id = ?",
+                [*log_ids, normalized],
+            )
+            await conn.commit()
+        return int(cursor.rowcount or 0)
+
+    async def find_most_recent_unlogged_day_index(
+        self,
+        on_or_before: date,
+        *,
+        user_id: Optional[str | int] = None,
+    ) -> Optional[int]:
+        normalized = self._normalize_user_id(user_id)
+        program = await self.get_active_program(normalized)
+        if not program:
+            return None
+        start_date = await self.get_program_start_date(normalized)
+        if start_date is None:
+            return None
+        days = await self.get_program_days(int(program["id"]))
+        if not days:
+            return None
+
+        max_index = min((on_or_before - start_date).days, len(days) - 1)
+        if max_index < 0:
+            return None
+
+        for idx in range(max_index, -1, -1):
+            day = days[idx]
+            if bool(day.get("is_rest_day")):
+                continue
+            if await self.count_logged_sets_for_program_day(int(day["id"]), user_id=normalized):
+                continue
+            return int(day["day_order"])
+        return None
 
     async def add_activity(
         self,
@@ -1628,7 +1821,11 @@ class Database:
                     last_workout_date = NULL,
                     last_checkin_date = NULL,
                     current_day_index = 0,
-                    current_program_id = NULL
+                    current_program_id = NULL,
+                    current_block = NULL,
+                    current_week = NULL,
+                    current_day_number = 1,
+                    program_start_date = NULL
                 WHERE user_id = ?
                 """
                 ,
@@ -1680,7 +1877,16 @@ class Database:
 
             await conn.execute("DELETE FROM programs WHERE id = ?", (program_id,))
             await conn.execute(
-                "UPDATE user_state SET current_program_id = NULL, current_day_index = 0 WHERE user_id = ?",
+                """
+                UPDATE user_state
+                SET current_program_id = NULL,
+                    current_day_index = 0,
+                    current_block = NULL,
+                    current_week = NULL,
+                    current_day_number = 1,
+                    program_start_date = NULL
+                WHERE user_id = ?
+                """,
                 (normalized,),
             )
             await conn.commit()
@@ -1723,8 +1929,13 @@ class Database:
     async def build_context(self, target_date: date, user_id: Optional[str | int] = None) -> dict[str, Any]:
         normalized = self._normalize_user_id(user_id)
         day_index = await self.get_current_day_index(normalized)
+        current_program = await self.get_active_program(normalized)
+        current_day = await self.get_day_for_index(day_index, user_id=normalized)
+        total_weeks = await self.get_program_total_weeks(normalized)
+        scheduled_day_date = await self.get_program_day_date(day_index, user_id=normalized)
         return {
-            "current_program": await self.get_active_program(normalized),
+            "current_program": current_program,
+            "current_day": current_day,
             "todays_exercises": await self.get_exercises_for_day_index(day_index, user_id=normalized),
             "last_session_logs": await self.get_last_logs_for_day_index(day_index, user_id=normalized),
             "recent_activities": await self.get_activities_last_7_days(user_id=normalized),
@@ -1732,6 +1943,8 @@ class Database:
             "weekly_volume": await self.get_weekly_volume(user_id=normalized),
             "recent_performance_trend": await self.get_trend_last_4_weeks(user_id=normalized),
             "recent_prs": await self.get_recent_prs(days=14, user_id=normalized),
+            "program_total_weeks": total_weeks,
+            "scheduled_day_date": scheduled_day_date.isoformat() if scheduled_day_date else None,
             "target_date": target_date.isoformat(),
         }
 

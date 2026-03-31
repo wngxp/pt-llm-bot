@@ -9,6 +9,7 @@ from discord.ext import commands
 from llm.prompts import ASK_SYSTEM_PROMPT
 from utils.conversation_memory import ConversationMemory
 from utils.discord_messages import send_discord_text
+from utils.week_context import get_program_position, inject_program_context
 
 
 QUESTION_WORD_RE = re.compile(r"\b(what|why|how|can|should|when|where|which|who)\b", re.IGNORECASE)
@@ -73,18 +74,32 @@ class AskCog(commands.Cog):
     async def _answer(self, question: str, *, user_id: int, channel_id: int) -> str:
         context = await self.db.build_context(target_date=self.bot.today(), user_id=str(user_id))
         history = self.memory.get(user_id=user_id, channel_id=channel_id)
+        state = context.get("user_state") or {}
+        current_day = context.get("current_day") or {}
+        current_program = context.get("current_program") or {}
+        block, week, day_number, day_name = get_program_position(current_day, state)
+        system_prompt = inject_program_context(
+            ASK_SYSTEM_PROMPT,
+            program_name=str(current_program.get("name") or "").strip() or None,
+            block=block,
+            week=week,
+            day_number=day_number,
+            day_name=day_name,
+        )
         prompt = {
             "question": question,
             "history": history,
             "context": {
-                "phase": context["user_state"].get("phase"),
-                "readiness": context["user_state"].get("readiness"),
+                "phase": state.get("phase"),
+                "readiness": state.get("readiness"),
                 "weekly_volume": context.get("weekly_volume"),
                 "recent_prs": context.get("recent_prs")[:5],
+                "current_day": current_day,
+                "program_total_weeks": context.get("program_total_weeks"),
             },
         }
         return await self.bot.ollama.chat(
-            system=ASK_SYSTEM_PROMPT,
+            system=system_prompt,
             user=json.dumps(prompt, ensure_ascii=False),
             temperature=0.3,
             max_tokens=300,

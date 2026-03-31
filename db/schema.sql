@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS user_state (
     current_block TEXT,
     current_week INTEGER,
     current_day_number INTEGER,
+    program_start_date TEXT,
     readiness INTEGER DEFAULT 7,
     weeks_since_deload INTEGER DEFAULT 0,
     current_streak INTEGER DEFAULT 0,

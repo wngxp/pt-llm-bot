@@ -6,6 +6,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -443,6 +444,37 @@ class ProgrammeCog(commands.Cog):
         filename = str(getattr(attachment, "filename", "") or "").lower()
         return filename.endswith((".xlsx", ".xlsm", ".xls", ".csv"))
 
+    def _structured_program_name(self, payload: dict[str, Any], filename: str) -> str:
+        current = str(payload.get("program_name") or "").strip()
+        if current and current.lower() != "structured logbook":
+            return current
+        stem = Path(filename).stem.replace("-", " ").replace("_", " ").strip()
+        if not stem:
+            return current or "Structured Logbook"
+        words = ["".join(ch for ch in word if ch.isalnum()) for word in stem.split()]
+        cleaned_words = [word for word in words if word]
+        if not cleaned_words:
+            return current or "Structured Logbook"
+        return " ".join(word.upper() if word.isupper() else word.title() for word in cleaned_words)
+
+    def _format_first_week_schedule(self, summary: dict[str, Any]) -> str:
+        schedule = summary.get("first_week_schedule") if isinstance(summary, dict) else None
+        if not isinstance(schedule, list) or not schedule:
+            return ""
+        lines = ["Week 1 schedule:"]
+        for day in schedule:
+            if not isinstance(day, dict):
+                continue
+            day_number = int(day.get("day_number") or 0)
+            day_name = str(day.get("day_name") or "Day").strip() or "Day"
+            if bool(day.get("is_rest_day")):
+                lines.append(f"- Day {day_number}: {day_name}")
+                continue
+            exercise_count = int(day.get("exercise_count") or 0)
+            exercise_label = "exercise" if exercise_count == 1 else "exercises"
+            lines.append(f"- Day {day_number}: {day_name} ({exercise_count} {exercise_label})")
+        return "\n".join(lines)
+
     async def _import_structured_logbook_attachment(
         self,
         channel: discord.abc.Messageable,
@@ -467,6 +499,7 @@ class ProgrammeCog(commands.Cog):
             return True
 
         user_id = str(author.id)
+        payload["program_name"] = self._structured_program_name(payload, filename)
         async with channel.typing():
             recent = await self.db.get_recent_program_by_name(str(payload["program_name"]), user_id=user_id, minutes=5)
             if recent:
@@ -486,24 +519,37 @@ class ProgrammeCog(commands.Cog):
             await self.db.set_current_day_index(first_active_idx, user_id=user_id)
             label = str(summary.get("label") or payload["program_name"])
             total_days = int(summary.get("days") or len(payload.get("days", [])))
+            training_days = int(summary.get("training_days") or 0)
+            rest_days = int(summary.get("rest_days") or 0)
+            total_rows = int(summary.get("source_rows") or 0)
             total_exercises = int(
                 summary.get("exercises") or sum(len(day.get("exercises", [])) for day in payload.get("days", []))
             )
             total_weeks = int(summary.get("weeks") or 0)
+            schedule_summary = self._format_first_week_schedule(summary)
         else:
             label = str(payload["program_name"])
             total_days = len(payload.get("days", []))
+            training_days = 0
+            rest_days = 0
+            total_rows = 0
             total_exercises = sum(len(day.get("exercises", [])) for day in payload.get("days", []))
             total_weeks = 0
+            schedule_summary = ""
 
         if created_program:
             display_id = int(created_program.get("display_id") or program_id)
             logger.info("Imported structured logbook %s as program %s", label, display_id)
-        week_suffix = f" across {total_weeks} weeks" if total_weeks > 0 else ""
-        await send_discord_text(
-            channel,
-            f"Imported {label} - {total_days} days, {total_exercises} exercises{week_suffix}.",
-        )
+        lines = [f"Imported **{payload['program_name']}** (ID {display_id if created_program else program_id})."]
+        count_line = f"Weeks: {total_weeks} | Exercises: {total_exercises} | Total days: {total_days}"
+        if total_rows and total_rows != total_exercises:
+            count_line = f"{count_line} | CSV rows: {total_rows}"
+        if training_days or rest_days:
+            count_line = f"{count_line} | Training days: {training_days} | Rest days: {rest_days}"
+        lines.append(count_line)
+        if schedule_summary:
+            lines.append(schedule_summary)
+        await send_discord_text(channel, "\n".join(lines))
         return True
 
     async def _build_active_program_context(self, user_id: str) -> Optional[dict[str, Any]]:

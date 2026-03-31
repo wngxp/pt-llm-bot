@@ -10,6 +10,7 @@ from discord.ext import commands
 from llm.prompts import COACH_SYSTEM_PROMPT
 from utils.conversation_memory import ConversationMemory
 from utils.discord_messages import send_discord_text
+from utils.week_context import get_program_position, inject_program_context
 
 
 DAY_HINT_RE = re.compile(r"^\s*(day\s*\d+|push|pull|legs?|upper|lower)\b", re.IGNORECASE | re.MULTILINE)
@@ -43,20 +44,34 @@ class CoachCog(commands.Cog):
         user_id = str(message.author.id)
         context = await self.db.build_context(target_date=self.bot.today(), user_id=user_id)
         history = self.memory.get(user_id=message.author.id, channel_id=message.channel.id)
+        state = context.get("user_state") or {}
+        current_day = context.get("current_day") or {}
+        current_program = context.get("current_program") or {}
+        block, week, day_number, day_name = get_program_position(current_day, state)
+        system_prompt = inject_program_context(
+            COACH_SYSTEM_PROMPT,
+            program_name=str(current_program.get("name") or "").strip() or None,
+            block=block,
+            week=week,
+            day_number=day_number,
+            day_name=day_name,
+        )
         payload = {
             "message": content,
             "history": history,
             "context": {
-                "current_program": context.get("current_program"),
-                "user_state": context.get("user_state"),
+                "current_program": current_program,
+                "current_day": current_day,
+                "user_state": state,
                 "recent_prs": context.get("recent_prs", [])[:10],
                 "recent_activities": context.get("recent_activities", [])[:10],
                 "weekly_volume": context.get("weekly_volume"),
                 "recent_performance_trend": context.get("recent_performance_trend", [])[:10],
+                "program_total_weeks": context.get("program_total_weeks"),
             },
         }
         return await self.bot.ollama.chat(
-            system=COACH_SYSTEM_PROMPT,
+            system=system_prompt,
             user=json.dumps(payload, ensure_ascii=False),
             temperature=0.25,
             max_tokens=900,

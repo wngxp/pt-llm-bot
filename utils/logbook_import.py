@@ -269,14 +269,55 @@ def _build_program_payload(rows: list[dict[str, Any]], block_order: dict[str, in
         )
 
     unique_weeks = {(int(day["week"]), str(day["block"])) for day in days if day.get("week") is not None}
+    rest_days = [day for day in days if bool(day.get("is_rest_day"))]
+    training_days = [day for day in days if not bool(day.get("is_rest_day"))]
+    block_week_counts: dict[str, int] = {}
+    for week, block in unique_weeks:
+        del week
+        block_week_counts[block] = block_week_counts.get(block, 0) + 1
+    total_source_rows = len(rows)
     total_exercises = sum(len(day.get("exercises", [])) for day in days)
     first_active_index = next((idx for idx, day in enumerate(days) if not bool(day.get("is_rest_day"))), 0)
+    first_week_schedule: list[dict[str, Any]] = []
+    if days:
+        first_day = min(
+            days,
+            key=lambda day: (
+                block_order.get(str(day.get("block") or ""), 10_000),
+                int(day.get("week") or 0),
+                int(day.get("day_number") or 0),
+            ),
+        )
+        target_block = str(first_day.get("block") or "")
+        target_week = int(first_day.get("week") or 0)
+        week_days = [
+            day for day in days
+            if str(day.get("block") or "") == target_block and int(day.get("week") or -1) == target_week
+        ]
+        week_days.sort(key=lambda day: int(day.get("day_number") or 0))
+        for day in week_days:
+            first_week_schedule.append(
+                {
+                    "block": str(day.get("block") or ""),
+                    "week": int(day.get("week") or 0),
+                    "day_number": int(day.get("day_number") or 0),
+                    "day_name": str(day.get("name") or ""),
+                    "is_rest_day": int(bool(day.get("is_rest_day"))),
+                    "exercise_count": len(day.get("exercises", [])),
+                }
+            )
+
     summary = {
         "label": _block_summary_label(block_names),
+        "source_rows": total_source_rows,
         "days": len(days),
+        "training_days": len(training_days),
+        "rest_days": len(rest_days),
         "exercises": total_exercises,
         "weeks": len(unique_weeks),
+        "block_week_counts": block_week_counts,
         "first_active_day_index": first_active_index,
+        "first_week_schedule": first_week_schedule,
         "blocks": block_names,
     }
     program_name = block_names[0] if len(block_names) == 1 else "Structured Logbook"

@@ -55,10 +55,14 @@ if "discord" not in sys.modules:
     sys.modules["discord.ext"] = discord_ext_module
     sys.modules["discord.ext.commands"] = commands_module
 
+from cogs.backfill import BackfillCog
 from cogs.workout import WorkoutCog
 from db.database import Database
 from utils.logbook_import import parse_structured_logbook_bytes
 from utils.warmup import generate_pyramid_warmup
+
+FIXTURES_DIR = Path(__file__).with_name("fixtures")
+FULL_JNULPPL_CSV = FIXTURES_DIR / "jnulppl_full.csv"
 
 
 class _DummySettings:
@@ -80,6 +84,9 @@ class _DummyBot:
     def get_channel(self, channel_id: int) -> None:  # noqa: ARG002
         return None
 
+    def get_cog(self, name: str) -> None:  # noqa: ARG002
+        return None
+
 
 class _FakeChannel:
     def __init__(self) -> None:
@@ -92,6 +99,26 @@ class _FakeChannel:
             self.messages.append(text)
         elif "file" in kwargs:
             self.messages.append("<file>")
+
+
+class _FakeAuthor:
+    def __init__(self, user_id: int = 1) -> None:
+        self.id = user_id
+        self.bot = False
+        self.display_name = f"user-{user_id}"
+
+
+class _FakeContext:
+    def __init__(self, channel: _FakeChannel, author: _FakeAuthor) -> None:
+        self.channel = channel
+        self.author = author
+
+
+class _FakeMessage:
+    def __init__(self, channel: _FakeChannel, author: _FakeAuthor, content: str) -> None:
+        self.channel = channel
+        self.author = author
+        self.content = content
 
 
 def _build_workbook_bytes() -> bytes:
@@ -275,6 +302,8 @@ class StructuredImportTests(unittest.TestCase):
 
         self.assertEqual(payload["program_name"], "Foundation")
         self.assertEqual(payload["import_summary"]["days"], 8)
+        self.assertEqual(payload["import_summary"]["training_days"], 4)
+        self.assertEqual(payload["import_summary"]["rest_days"], 4)
         self.assertEqual(payload["import_summary"]["exercises"], 4)
         self.assertEqual(payload["import_summary"]["weeks"], 4)
 
@@ -310,6 +339,7 @@ class StructuredImportTests(unittest.TestCase):
             self.assertEqual(state["current_block"], "Foundation")
             self.assertEqual(state["current_week"], 2)
             self.assertEqual(state["current_day_number"], 1)
+            self.assertEqual(state["program_start_date"], date.today().isoformat())
 
     def test_database_finds_day_by_week_and_day_number(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -320,6 +350,98 @@ class StructuredImportTests(unittest.TestCase):
 
             idx = asyncio.run(db.find_day_index_by_week_day(week=4, day_number=2, user_id="1", block="Foundation"))
             self.assertEqual(idx, 5)
+
+    def test_parser_loads_full_jnulppl_csv_fixture(self) -> None:
+        payload = parse_structured_logbook_bytes(FULL_JNULPPL_CSV.read_bytes(), FULL_JNULPPL_CSV.name)
+
+        days = payload["days"]
+        summary = payload["import_summary"]
+        unique_days = {(day["block"], day["week"], day["day_number"], day["name"]) for day in days}
+        unique_weeks = {(day["block"], day["week"]) for day in days}
+        rest_days = [day for day in days if day["is_rest_day"] == 1]
+        training_days = [day for day in days if day["is_rest_day"] == 0]
+
+        self.assertEqual(summary["source_rows"], 432)
+        self.assertEqual(summary["exercises"], 408)
+        self.assertEqual(len(unique_days), 84)
+        self.assertEqual(len(unique_weeks), 12)
+        # The real expanded CSV has 2 rest days per week across all 12 weeks.
+        self.assertEqual(len(rest_days), 24)
+        self.assertEqual(len(training_days), 60)
+        self.assertEqual(summary["rest_days"], 24)
+        self.assertEqual(summary["training_days"], 60)
+        self.assertEqual(summary["block_week_counts"], {"Foundation": 5, "Ramping": 7})
+
+        first_week_schedule = summary["first_week_schedule"]
+        self.assertEqual(len(first_week_schedule), 7)
+        self.assertEqual(first_week_schedule[0]["day_name"], "Upper Strength")
+        self.assertEqual(first_week_schedule[0]["exercise_count"], 7)
+        self.assertEqual(first_week_schedule[2]["day_name"], "Rest Day")
+        self.assertEqual(first_week_schedule[2]["exercise_count"], 0)
+
+
+class BackfillTests(unittest.TestCase):
+    def test_backfill_rejects_rest_day(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.sqlite3")
+            asyncio.run(db.init())
+            asyncio.run(_create_structured_program(db))
+            asyncio.run(db.set_program_start_date("2026-03-30", user_id="1"))
+
+            bot = _DummyBot(db)
+            cog = BackfillCog(bot)
+            channel = _FakeChannel()
+            ctx = _FakeContext(channel, _FakeAuthor())
+
+            asyncio.run(cog.backfill_command(ctx, target="week 1 day 2"))
+
+            self.assertIn("rest day - nothing to log", channel.messages[-1].lower())
+
+    def test_backfill_logs_sets_for_current_day_and_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.sqlite3")
+            asyncio.run(db.init())
+            program_id, day_id, exercise_id = asyncio.run(_create_structured_program(db))
+            asyncio.run(db.clear_logs_for_program_day(day_id, user_id="1"))
+            asyncio.run(db.set_program_start_date("2026-03-30", user_id="1"))
+
+            del program_id
+            bot = _DummyBot(db)
+            cog = BackfillCog(bot)
+            channel = _FakeChannel()
+            author = _FakeAuthor()
+            ctx = _FakeContext(channel, author)
+
+            asyncio.run(cog.backfill_command(ctx, target="week 1 day 1"))
+            self.assertTrue(any("Backfill: Foundation Week 1 Day 1 - Upper Strength" in message for message in channel.messages))
+
+            asyncio.run(cog.on_message(_FakeMessage(channel, author, "1: 125x8, 125x8")))
+
+            logs = asyncio.run(db.get_logs_for_program_day(day_id, user_id="1"))
+            self.assertEqual(len(logs), 2)
+            self.assertTrue(all(log["date"] == "2026-03-30" for log in logs))
+            self.assertTrue(any("Logged 2 sets across 1 exercises for Week 1 Day 1." in message for message in channel.messages))
+            self.assertEqual(asyncio.run(db.get_current_day_index("1")), 2)
+            prs = asyncio.run(db.get_recent_prs(days=3650, user_id="1"))
+            self.assertTrue(any(pr["workout_log_id"] in {log["id"] for log in logs} for pr in prs))
+            self.assertEqual(exercise_id, int(logs[0]["exercise_id"]))
+
+    def test_backfill_prompts_before_overwriting_existing_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.sqlite3")
+            asyncio.run(db.init())
+            asyncio.run(_create_structured_program(db))
+            asyncio.run(db.set_program_start_date("2026-03-30", user_id="1"))
+
+            bot = _DummyBot(db)
+            cog = BackfillCog(bot)
+            channel = _FakeChannel()
+            author = _FakeAuthor()
+            ctx = _FakeContext(channel, author)
+
+            asyncio.run(cog.backfill_command(ctx, target="week 1 day 1"))
+
+            self.assertTrue(any("already has logged sets" in message for message in channel.messages))
 
 
 class WarmupTests(unittest.TestCase):

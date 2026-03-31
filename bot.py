@@ -50,6 +50,7 @@ class PTBot(commands.Bot):
         for ext in [
             "cogs.programme",
             "cogs.workout",
+            "cogs.backfill",
             "cogs.activity",
             "cogs.checkin",
             "cogs.ask",

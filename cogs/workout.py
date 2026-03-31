@@ -25,6 +25,13 @@ from utils.plates import plates_breakdown
 from utils.progression import suggest_weight
 from utils.volume import format_volume_report
 from utils.warmup import generate_pyramid_warmup, generate_warmup
+from utils.week_context import (
+    get_program_position,
+    get_session_summary_note,
+    get_week_intro_message,
+    get_weight_progression_note,
+    inject_program_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1251,6 +1258,8 @@ class WorkoutCog(commands.Cog):
 
         next_set = session.set_counts[exercise_id] + 1
         structured_logbook = self._is_structured_program_day(session.day) or self._is_structured_logbook_exercise(exercise)
+        week_intro = get_week_intro_message(session.day.get("block"), session.day.get("week"))
+        weight_note = get_weight_progression_note(session.day.get("block"), session.day.get("week"))
         final_multiplier = activity_multiplier * readiness_multiplier
         suggestion = suggest_weight(exercise, logs, adjustment_multiplier=final_multiplier)
         if not logs and readiness <= 5:
@@ -1259,6 +1268,11 @@ class WorkoutCog(commands.Cog):
             )
         if not logs and bool(exercise.get("session_override")):
             suggestion = f"{suggestion} You don't have history for {exercise['name']} yet. Start conservative."
+        if structured_logbook and weight_note:
+            if logs:
+                suggestion = f"{suggestion} {weight_note}"
+            else:
+                suggestion = f"{suggestion} {weight_note}"
 
         last_lines: list[str] = []
         if logs:
@@ -1289,7 +1303,10 @@ class WorkoutCog(commands.Cog):
 
         lines = []
         if intro:
-            lines.append("Let's go.")
+            if structured_logbook and week_intro:
+                lines.append(week_intro)
+            else:
+                lines.append("Let's go.")
 
         if session.superset:
             group = self._superset_members(session)
@@ -1417,7 +1434,7 @@ class WorkoutCog(commands.Cog):
         session.rest_task = None
         session.rest_seconds = 0
 
-    def _build_session_summary(self, session: WorkoutSession) -> str:
+    async def _build_session_summary(self, session: WorkoutSession) -> str:
         completed_exercises = 0
         for ex in session.exercises:
             if session.set_counts.get(int(ex["id"]), 0) > 0:
@@ -1433,6 +1450,18 @@ class WorkoutCog(commands.Cog):
             f"Session complete for **{session.day['name']}**.",
             f"Completed: {completed_exercises} exercises, {len(session.logged_sets)} sets.",
         ]
+        if self._is_structured_program_day(session.day):
+            total_weeks = await self.db.get_program_total_weeks(session.user_id)
+            scheduled_date = await self.db.get_program_day_date(session.day_index, user_id=session.user_id)
+            progress_line = f"Progress: Week {int(session.day.get('week') or 0)}"
+            if total_weeks:
+                progress_line = f"{progress_line} of {total_weeks}"
+            if scheduled_date is not None:
+                progress_line = f"{progress_line} (scheduled {scheduled_date.isoformat()})"
+            lines.append(progress_line)
+            summary_note = get_session_summary_note(session.day.get("block"), session.day.get("week"))
+            if summary_note:
+                lines.append(summary_note)
         if session.pr_events:
             lines.append(f"PRs hit: {len(session.pr_events)}")
 
@@ -1455,7 +1484,7 @@ class WorkoutCog(commands.Cog):
 
     async def _complete_session(self, channel: discord.abc.Messageable, session: WorkoutSession) -> None:
         await self._cancel_rest(session)
-        summary = self._build_session_summary(session)
+        summary = await self._build_session_summary(session)
         streak = await self.db.mark_workout_completed(date.today(), user_id=session.user_id)
         await self.db.advance_day_index(user_id=session.user_id, skip_rest_days=True)
         self.sessions.pop(session.user_id, None)
@@ -2321,6 +2350,16 @@ class WorkoutCog(commands.Cog):
     async def _answer_workout_question(self, session: WorkoutSession, question: str) -> str:
         state = await self.db.get_user_state(session.user_id)
         current = session.current_exercise()
+        program = await self.db.get_active_program(session.user_id)
+        block, week, day_number, day_name = get_program_position(session.day, state)
+        system_prompt = inject_program_context(
+            ASK_SYSTEM_PROMPT,
+            program_name=str(program.get("name") or "").strip() if program else None,
+            block=block,
+            week=week,
+            day_number=day_number,
+            day_name=day_name,
+        )
         payload = {
             "question": question,
             "response_style": "Keep the answer to 2-3 short sentences.",
@@ -2329,10 +2368,11 @@ class WorkoutCog(commands.Cog):
                 "current_exercise": current,
                 "phase": state.get("phase"),
                 "readiness": state.get("readiness"),
+                "program_total_weeks": await self.db.get_program_total_weeks(session.user_id),
             },
         }
         reply = await self.bot.ollama.chat(
-            system=ASK_SYSTEM_PROMPT,
+            system=system_prompt,
             user=json.dumps(payload, ensure_ascii=False),
             temperature=0.25,
             max_tokens=150,
@@ -2826,6 +2866,15 @@ class WorkoutCog(commands.Cog):
         lowered = self._normalize_user_text(content)
         user_id = self._session_key(message.author.id)
         session = self.sessions.get(user_id)
+        backfill_cog = self.bot.get_cog("BackfillCog")
+        is_backfill_pending = False
+        if backfill_cog is not None:
+            waiting = getattr(backfill_cog, "is_waiting_for_input", None)
+            if callable(waiting):
+                is_backfill_pending = bool(waiting(user_id=message.author.id, channel_id=message.channel.id))
+
+        if is_backfill_pending:
+            return
 
         if not session:
             if not await self._check_weekday_start_channel(message.channel, user_id):
