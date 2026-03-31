@@ -85,6 +85,16 @@ HELP_ENTRIES = {
         "description": "Draft a temporary travel version of the active program.",
         "channel": "#programme",
     },
+    "backfill": {
+        "syntax": "!backfill week <W> day <D> | !backfill yesterday",
+        "description": "Backfill a missed training day into the current program timeline.",
+        "channel": "Workout channels, #commands, #settings, or #programme",
+    },
+    "startdate": {
+        "syntax": "!startdate <YYYY-MM-DD>",
+        "description": "Set the program start date used for week/day backfill mapping.",
+        "channel": "Workout channels, #commands, #settings, or #programme",
+    },
     "start": {
         "syntax": "!start",
         "description": "Start today's workout session in the current weekday channel.",

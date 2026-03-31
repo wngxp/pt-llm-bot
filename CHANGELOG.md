@@ -3,6 +3,7 @@
 - Structured JN logbook import now reports honest CSV counts from the real fixture: `432` source rows, `408` exercise entries, `84` unique days, `24` rest days, and `60` training days, instead of treating blank rest-day rows as exercises.
 - Structured CSV import now preserves Foundation/Ramping week layout correctly, including rest-day rows and block week counts (`Foundation=5`, `Ramping=7`).
 - Workout, `#ask`, and `#coach` context now include the current program block/week/day so week-specific guidance is anchored to the active training position.
+- `!backfill` and `!startdate` no longer fail silently outside weekday workout channels; they now work in `#commands`, `#settings`, and `#programme`, and the interactive backfill entry flow continues in the channel where it was started.
 
 ### Added
 - New week/block guidance helpers in `utils/week_context.py` for week-aware intros, context injection, and program-position lookups.

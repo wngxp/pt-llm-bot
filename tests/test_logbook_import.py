@@ -70,6 +70,7 @@ class _DummySettings:
     prs_channel_id = None
     workout_channel_ids: set[int] = set()
     settings_channel_id = None
+    programme_channel_id = None
 
 
 class _DummyBot:
@@ -89,9 +90,9 @@ class _DummyBot:
 
 
 class _FakeChannel:
-    def __init__(self) -> None:
-        self.id = 1
-        self.name = "mon"
+    def __init__(self, *, channel_id: int = 1, name: str = "mon") -> None:
+        self.id = channel_id
+        self.name = name
         self.messages: list[str] = []
 
     async def send(self, text: str | None = None, **kwargs) -> None:  # noqa: ANN003
@@ -426,6 +427,29 @@ class BackfillTests(unittest.TestCase):
             self.assertTrue(any(pr["workout_log_id"] in {log["id"] for log in logs} for pr in prs))
             self.assertEqual(exercise_id, int(logs[0]["exercise_id"]))
 
+    def test_backfill_runs_from_programme_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.sqlite3")
+            asyncio.run(db.init())
+            _, day_id, _ = asyncio.run(_create_structured_program(db))
+            asyncio.run(db.clear_logs_for_program_day(day_id, user_id="1"))
+            asyncio.run(db.set_program_start_date("2026-03-30", user_id="1"))
+
+            bot = _DummyBot(db)
+            cog = BackfillCog(bot)
+            channel = _FakeChannel(name="programme")
+            author = _FakeAuthor()
+            ctx = _FakeContext(channel, author)
+
+            asyncio.run(cog.backfill_command(ctx, target="week 1 day 1"))
+            self.assertTrue(any("Backfill: Foundation Week 1 Day 1 - Upper Strength" in message for message in channel.messages))
+
+            asyncio.run(cog.on_message(_FakeMessage(channel, author, "1: 125x8, 125x8")))
+
+            logs = asyncio.run(db.get_logs_for_program_day(day_id, user_id="1"))
+            self.assertEqual(len(logs), 2)
+            self.assertTrue(any("Logged 2 sets across 1 exercises for Week 1 Day 1." in message for message in channel.messages))
+
     def test_backfill_prompts_before_overwriting_existing_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = Database(Path(tmpdir) / "test.sqlite3")
@@ -442,6 +466,21 @@ class BackfillTests(unittest.TestCase):
             asyncio.run(cog.backfill_command(ctx, target="week 1 day 1"))
 
             self.assertTrue(any("already has logged sets" in message for message in channel.messages))
+
+    def test_startdate_runs_from_commands_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "test.sqlite3")
+            asyncio.run(db.init())
+
+            bot = _DummyBot(db)
+            cog = BackfillCog(bot)
+            channel = _FakeChannel(name="commands")
+            ctx = _FakeContext(channel, _FakeAuthor())
+
+            asyncio.run(cog.startdate_command(ctx, "2026-03-30"))
+
+            self.assertEqual(asyncio.run(db.get_program_start_date("1")).isoformat(), "2026-03-30")
+            self.assertTrue(any("Program start date set to 2026-03-30." in message for message in channel.messages))
 
 
 class WarmupTests(unittest.TestCase):

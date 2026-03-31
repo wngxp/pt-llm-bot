@@ -55,6 +55,24 @@ class BackfillCog(commands.Cog):
             return cid in self.settings.workout_channel_ids
         return name in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 
+    def _is_backfill_command_channel(
+        self,
+        channel: discord.abc.GuildChannel | discord.Thread | discord.abc.PrivateChannel,
+    ) -> bool:
+        cid = getattr(channel, "id", None)
+        name = str(getattr(channel, "name", "")).strip().lower()
+        if self._is_workout_channel(channel):
+            return True
+
+        settings_id = getattr(self.settings, "settings_channel_id", None)
+        programme_id = getattr(self.settings, "programme_channel_id", None)
+        if settings_id and cid == settings_id:
+            return True
+        if programme_id and cid == programme_id:
+            return True
+
+        return name in {"settings", "commands", "programme"}
+
     def is_waiting_for_input(self, *, user_id: int, channel_id: int) -> bool:
         return self._pending_key(user_id, channel_id) in self.pending
 
@@ -375,7 +393,11 @@ class BackfillCog(commands.Cog):
 
     @commands.command(name="backfill")
     async def backfill_command(self, ctx: commands.Context, *, target: str) -> None:
-        if not self._is_workout_channel(ctx.channel):
+        if not self._is_backfill_command_channel(ctx.channel):
+            await send_discord_text(
+                ctx.channel,
+                "Use `!backfill` in a workout channel, `#commands`, `#settings`, or `#programme`.",
+            )
             return
         if self._has_active_workout_session(ctx.author.id):
             await send_discord_text(ctx.channel, "Finish or pause your current workout before starting a backfill.")
@@ -407,7 +429,11 @@ class BackfillCog(commands.Cog):
 
     @commands.command(name="startdate")
     async def startdate_command(self, ctx: commands.Context, iso_date: str) -> None:
-        if not self._is_workout_channel(ctx.channel):
+        if not self._is_backfill_command_channel(ctx.channel):
+            await send_discord_text(
+                ctx.channel,
+                "Use `!startdate` in a workout channel, `#commands`, `#settings`, or `#programme`.",
+            )
             return
         cleaned = iso_date.strip()
         if not DATE_RE.fullmatch(cleaned):
@@ -425,14 +451,15 @@ class BackfillCog(commands.Cog):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
-        if not self._is_workout_channel(message.channel):
-            return
-        if message.content.startswith(self.settings.command_prefix):
-            return
-
         key = self._pending_key(message.author.id, message.channel.id)
         pending = self.pending.get(key)
         if pending is None:
+            if not self._is_backfill_command_channel(message.channel):
+                return
+            if message.content.startswith(self.settings.command_prefix):
+                return
+            return
+        if message.content.startswith(self.settings.command_prefix):
             return
 
         content = message.content.strip()

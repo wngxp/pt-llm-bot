@@ -24,6 +24,8 @@
 | `!program` | `!program` | Show your active program with full day-by-day exercise details. |
 | `!startday` | `!startday <day name or number>` | Set which day to start from after importing or editing a program. |
 | `!travel` | `!travel <constraints>` | Draft a temporary travel version of your active program. |
+| `!backfill` | `!backfill week <W> day <D>` or `!backfill yesterday` | Backfill a missed training day into the current program timeline. |
+| `!startdate` | `!startdate <YYYY-MM-DD>` | Set the program start date used for week/day backfill mapping. |
 | `!checkin` | `!checkin` | Generate a weekly check-in summary in `#check-in`. |
 | `!summary` | `!summary` | Generate the weekly summary in `#check-in`. |
 | `!prs` | `!prs [days]` | Show recently recorded PR entries. |
@@ -75,3 +77,4 @@
 - Long bot replies are automatically split into multiple Discord messages before hitting the character limit.
 - PR announcements are limited to qualifying heavy barbell squat, bench, and deadlift variations.
 - Equipment switches and exercise reordering during a workout are session-only. They do not rewrite the saved program.
+- `!backfill` and `!startdate` work in workout channels as well as `#commands`, `#settings`, and `#programme`.
